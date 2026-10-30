@@ -1,0 +1,22 @@
+[package]
+name = "rudp"
+version = "0.1.0"
+edition = "2021"
+description = "eBPF-accelerated zero-copy UDP-to-FakeTCP obfuscator"
+
+[[bin]]
+name = "rudp_client"
+path = "src/bin/rudp_client.rs"
+
+[[bin]]
+name = "rudp_server"
+path = "src/bin/rudp_server.rs"
+
+[dependencies]
+aya = "0.13"
+clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
+libc = "0.2"
+log = "0.4"
+rand = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }

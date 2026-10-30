@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive_suffix: x86_64-linux-gnu
+          - target: x86_64-unknown-linux-musl
+            archive_suffix: x86_64-linux-musl
+          - target: aarch64-unknown-linux-musl
+            archive_suffix: aarch64-linux-musl
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang & musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+
+      - name: Configure rust-lld for cross targets
+        run: |
+          RUST_LLD=$(find $(rustc --print sysroot) -name rust-lld | head -n 1)
+          sudo ln -sf "$RUST_LLD" /usr/local/bin/rust-lld
+          mkdir -p .cargo
+          cat << 'EOF' > .cargo/config.toml
+          [target.aarch64-unknown-linux-musl]
+          linker = "rust-lld"
+          [target.x86_64-unknown-linux-musl]
+          linker = "rust-lld"
+          EOF
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package release archive
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+          PKG_NAME="rudp-${VERSION}-${{ matrix.archive_suffix }}"
+          mkdir -p "dist/${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/rudp_client" "dist/${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/rudp_server" "dist/${PKG_NAME}/"
+          cp README.md "dist/${PKG_NAME}/"
+          tar -C dist -czf "dist/${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          cd dist
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rudp-${{ matrix.archive_suffix }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clean up obsolete releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ github.ref_name }}" --yes || true
+          for tag in $(gh release list --json tagName -q '.[].tagName'); do
+            if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+              gh release delete "${tag}" --yes || true
+            fi
+          done
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
