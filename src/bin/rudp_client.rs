@@ -9,7 +9,7 @@ use rudp::{
     STATE_SYN_RECEIVED, STATE_SYN_SENT, TCP_FLAG_ACK, TCP_FLAG_RST, TCP_FLAG_SYN,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::signal::unix::{signal, SignalKind};
@@ -31,13 +31,17 @@ struct PendingHandshake {
 #[derive(Parser, Debug)]
 #[command(name = "rudp_client", version, about = "eBPF-accelerated UDP-to-FakeTCP Client")]
 struct Args {
-    /// Local UDP address:port to listen on (e.g. 0.0.0.0:9283)
+    /// Local UDP listen address:port or port (optional in --transparent mode; defaults to remote port)
     #[arg(short = 'l', long = "local")]
-    local: SocketAddr,
+    local: Option<String>,
 
-    /// Remote Fake-TCP server host:port (e.g. ip.rikaaa0928.moe:928)
+    /// Remote Fake-TCP server host:port (e.g. server.example.com:12345)
     #[arg(short = 'r', long = "remote")]
     remote: String,
+
+    /// Transparent mode: automatically hijack UDP packets to <remote_ip>:<local_port> without modifying client Endpoint
+    #[arg(short = 't', long = "transparent", env = "RUDP_TRANSPARENT", default_value_t = false)]
+    transparent: bool,
 
     /// Network interface to attach TC eBPF programs to (auto-detected if omitted)
     #[arg(short = 'i', long = "interface", default_value = "")]
@@ -52,32 +56,43 @@ struct Args {
     payload_padding_max_len: u8,
 
     /// Occasionally send dummy obfuscation packets
-    #[arg(long = "obfuscate", env = "PHANTUN_OBFUSCATE", default_value_t = false)]
+    #[arg(long = "obfuscate", env = "RUDP_OBFUSCATE", default_value_t = false)]
     obfuscate: bool,
 
     /// Probability (in percent) to send an obfuscation packet
-    #[arg(long = "obfuscate-prob", env = "PHANTUN_OBFUSCATE_PROB", default_value_t = 5.0)]
+    #[arg(long = "obfuscate-prob", env = "RUDP_OBFUSCATE_PROB", default_value_t = 5.0)]
     obfuscate_prob: f64,
 
-    /// Maximum random padding length for an obfuscation packet
-    #[arg(long = "obfuscate-max-len", env = "PHANTUN_OBFUSCATE_MAX_LEN", default_value_t = 255)]
+    /// Maximum random padding length for an obfuscation packet (1..=255)
+    #[arg(long = "obfuscate-max-len", env = "RUDP_OBFUSCATE_MAX_LEN", default_value_t = 255)]
     obfuscate_max_len: u8,
 
     /// Use realistic TCP options and PSH|ACK flags
     #[arg(long = "tcp-extensions", default_value_t = false)]
     tcp_extensions: bool,
 
-    /// Compatibility flags with phantun CLI (ignored in eBPF mode)
-    #[arg(long = "random-initial-seq", default_value_t = false)]
-    random_initial_seq: bool,
-    #[arg(long = "tun", default_value = "")]
-    tun: String,
-    #[arg(long = "tun-local", default_value = "")]
-    tun_local: String,
-    #[arg(long = "tun-peer", default_value = "")]
-    tun_peer: String,
-    #[arg(short = '4', long = "ipv4-only", default_value_t = false)]
-    ipv4_only: bool,
+    /// Disable NIC TX checksum offload (`ethtool -K <iface> tx off`) in transparent mode and restore on exit
+    #[arg(
+        long = "disable-tx-offload",
+        env = "RUDP_DISABLE_TX_OFFLOAD",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    disable_tx_offload: bool,
+
+    /// Shorthand to keep NIC TX checksum offload and TSO enabled (equivalent to --disable-tx-offload=false)
+    #[arg(long = "keep-tx-offload", default_value_t = false)]
+    keep_tx_offload: bool,
+}
+
+fn parse_local_addr(s: &str) -> Result<SocketAddr, String> {
+    if let Ok(port) = s.parse::<u16>() {
+        return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)));
+    }
+    s.parse::<SocketAddr>()
+        .map_err(|e| format!("invalid --local address or port '{s}': {e}"))
 }
 
 #[tokio::main]
@@ -94,6 +109,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => unreachable!(),
     };
     let remote_port = remote_addr.port();
+
+    let parsed_local = match args.local.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_local_addr(s)?),
+        _ => None,
+    };
+
+    let (bind_addr, local_port) = if args.transparent {
+        let target_port = parsed_local.map(|a| a.port()).unwrap_or(remote_port);
+        (
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            target_port,
+        )
+    } else {
+        let addr = parsed_local
+            .ok_or("--local <ADDR:PORT|PORT> is required unless --transparent is enabled")?;
+        (addr, addr.port())
+    };
+
     info!("Resolved remote server: {}:{}", remote_ipv4, remote_port);
 
     let net_if = detect_interface(Some(&args.interface), remote_ipv4)?;
@@ -102,23 +135,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_if.name, net_if.ipv4, net_if.mac, net_if.gateway_mac
     );
 
+    let udp_sock = UdpSocket::bind(bind_addr).await?;
+    let internal_udp_port = udp_sock.local_addr()?.port();
+    let raw_sock = RawTcpSocket::new()?;
+
     let mut ebpf = load_ebpf()?;
 
     let cfg = RudpConfig {
         mode: 0,
         local_ip: u32::from(net_if.ipv4).to_be(),
         remote_ip: u32::from(remote_ipv4).to_be(),
-        local_port: args.local.port(),
+        local_port,
         remote_port,
         padding_enabled: u8::from(args.payload_padding),
         padding_max_len: args.payload_padding_max_len.clamp(1, 5),
         obfuscate_enabled: u8::from(args.obfuscate),
         tcp_extensions: u8::from(args.tcp_extensions),
         obfuscate_prob_bp: ((args.obfuscate_prob.clamp(0.0, 100.0)) * 100.0) as u32,
-        obfuscate_max_len: args.obfuscate_max_len,
+        obfuscate_max_len: args.obfuscate_max_len.max(1),
+        transparent: u8::from(args.transparent),
+        internal_udp_port,
         local_mac: net_if.mac,
         gateway_mac: net_if.gateway_mac,
-        _pad: [0; 3],
     };
 
     {
@@ -129,7 +167,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = tc::qdisc_add_clsact(&net_if.name) {
         warn!("qdisc_add_clsact on {}: {} (continuing)", net_if.name, e);
     }
-    reset_clsact(&net_if.name, args.local.port());
+    reset_clsact(&net_if.name, local_port);
+
+    let manage_tx_offload = args.transparent && args.disable_tx_offload && !args.keep_tx_offload;
+    if manage_tx_offload {
+        match std::process::Command::new("ethtool")
+            .args(["-K", &net_if.name, "tx", "off"])
+            .output()
+        {
+            Ok(_) => info!("Disabled TX checksum offload on {} (will restore on exit)", net_if.name),
+            Err(e) => warn!("Failed to run ethtool -K {} tx off: {}", net_if.name, e),
+        }
+    }
 
     let ingress_prog: &mut SchedClassifier = ebpf
         .program_mut("rudp_client_ingress")
@@ -140,24 +189,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &net_if.name,
         TcAttachType::Ingress,
         TcAttachOptions::Netlink(NlOptions {
-            priority: args.local.port(),
+            priority: local_port,
             handle: 1,
         }),
     )?;
 
-    let udp_sock = UdpSocket::bind(args.local).await?;
-    let raw_sock = RawTcpSocket::new()?;
+    let _egress_link = if args.transparent {
+        let egress_prog: &mut SchedClassifier = ebpf
+            .program_mut("rudp_client_egress")
+            .unwrap()
+            .try_into()?;
+        egress_prog.load()?;
+        Some(egress_prog.attach_with_options(
+            &net_if.name,
+            TcAttachType::Egress,
+            TcAttachOptions::Netlink(NlOptions {
+                priority: local_port,
+                handle: 1,
+            }),
+        )?)
+    } else {
+        None
+    };
 
-    info!(
-        "rudp_client eBPF attached to {} (UDP listen={} -> FakeTCP remote={}:{}, padding={}, tcp_ext={}, obfuscate={})",
-        net_if.name,
-        args.local,
-        remote_ipv4,
-        remote_port,
-        args.payload_padding,
-        args.tcp_extensions,
-        args.obfuscate
-    );
+    if args.transparent {
+        info!(
+            "rudp_client eBPF attached to {} [TRANSPARENT MODE] (hijacking UDP {} -> FakeTCP {}:{}, internal_udp_port={}, padding={}, tcp_ext={}, obfuscate={}, disable_tx_offload={})",
+            net_if.name,
+            SocketAddrV4::new(remote_ipv4, local_port),
+            remote_ipv4,
+            remote_port,
+            internal_udp_port,
+            args.payload_padding,
+            args.tcp_extensions,
+            args.obfuscate,
+            manage_tx_offload
+        );
+    } else {
+        info!(
+            "rudp_client eBPF attached to {} (UDP listen={} -> FakeTCP remote={}:{}, padding={}, tcp_ext={}, obfuscate={})",
+            net_if.name,
+            bind_addr,
+            remote_ipv4,
+            remote_port,
+            args.payload_padding,
+            args.tcp_extensions,
+            args.obfuscate
+        );
+    }
 
     let mut buf = [0u8; 2048];
     let mut pending_handshakes: HashMap<PeerKey, PendingHandshake> = HashMap::new();
@@ -246,6 +325,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let port_be32 = port_be16 as u32;
                 let initial_seq: u32 = rand::thread_rng().gen();
 
+                let orig_dst_ip = if args.transparent {
+                    u32::from(remote_ipv4).to_be()
+                } else if peer_ipv4.is_loopback() {
+                    u32::from(Ipv4Addr::LOCALHOST).to_be()
+                } else {
+                    u32::from(net_if.ipv4).to_be()
+                };
+
                 info!(
                     "New UDP client {}, initiating Fake-TCP handshake (local_port={} -> {}:{})",
                     peer_addr, local_tcp_port, remote_ipv4, remote_port
@@ -258,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     seq: initial_seq,
                     ack: 0,
                     state: STATE_SYN_SENT,
-                    _pad0: 0,
+                    orig_dst_ip,
                     last_seen_ns: now,
                     peer_mac: net_if.gateway_mac,
                     local_mac: net_if.mac,
@@ -497,6 +584,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = raw_sock.send_to(&rst_pkt, remote_ipv4, remote_port);
             }
         }
+    }
+
+    if manage_tx_offload {
+        let _ = std::process::Command::new("ethtool")
+            .args(["-K", &net_if.name, "tx", "on", "tso", "on"])
+            .output();
+        info!("Restored TX checksum offload and TSO on {}", net_if.name);
     }
 
     Ok(())

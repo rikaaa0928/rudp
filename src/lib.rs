@@ -4,6 +4,8 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 pub const STATE_IDLE: u32 = 0;
 pub const STATE_SYN_SENT: u32 = 1;
@@ -32,9 +34,10 @@ pub struct RudpConfig {
     pub tcp_extensions: u8,
     pub obfuscate_prob_bp: u32,
     pub obfuscate_max_len: u8,
+    pub transparent: u8,
+    pub internal_udp_port: u16,
     pub local_mac: [u8; 6],
     pub gateway_mac: [u8; 6],
-    pub _pad: [u8; 3],
 }
 
 unsafe impl aya::Pod for RudpConfig {}
@@ -58,7 +61,7 @@ pub struct ConnState {
     pub seq: u32,
     pub ack: u32,
     pub state: u32,
-    pub _pad0: u32,
+    pub orig_dst_ip: u32,
     pub last_seen_ns: u64,
     pub peer_mac: [u8; 6],
     pub local_mac: [u8; 6],
@@ -137,7 +140,7 @@ pub fn detect_interface(override_name: Option<&str>, probe_target: Ipv4Addr) -> 
     };
 
     let mac = read_iface_mac(&if_name).unwrap_or([0; 6]);
-    let gateway_mac = read_gateway_mac(&if_name).unwrap_or([0; 6]);
+    let gateway_mac = read_gateway_mac(&if_name, probe_target).unwrap_or([0; 6]);
 
     Ok(NetIfInfo {
         name: if_name,
@@ -186,17 +189,104 @@ fn read_iface_mac(if_name: &str) -> Option<[u8; 6]> {
     parse_mac(s.trim())
 }
 
-fn read_gateway_mac(if_name: &str) -> Option<[u8; 6]> {
-    let arp = fs::read_to_string("/proc/net/arp").ok()?;
-    for line in arp.lines().skip(1) {
+/// Resolves the next-hop IPv4 address for `probe_target` on `if_name` from `/proc/net/route`.
+fn find_next_hop_ipv4(if_name: &str, probe_target: Ipv4Addr) -> Option<Ipv4Addr> {
+    const RTF_UP: u32 = 0x0001;
+    const RTF_GATEWAY: u32 = 0x0002;
+
+    let routes = fs::read_to_string("/proc/net/route").ok()?;
+    let target_u32 = u32::from(probe_target);
+
+    let mut best_match: Option<(u32, u32, Ipv4Addr)> = None; // (prefix_len, metric, next_hop)
+    let mut fallback_gw: Option<Ipv4Addr> = None;
+
+    for line in routes.lines().skip(1) {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() >= 6 && cols[5] == if_name && cols[3] != "00:00:00:00:00:00" {
-            if let Some(mac) = parse_mac(cols[3]) {
-                return Some(mac);
+        if cols.len() < 8 || cols[0] != if_name {
+            continue;
+        }
+        let dest_ne = u32::from_str_radix(cols[1], 16).ok()?;
+        let gw_ne = u32::from_str_radix(cols[2], 16).ok()?;
+        let flags = u32::from_str_radix(cols[3], 16).ok()?;
+        let metric = cols[6].parse::<u32>().unwrap_or(0);
+        let mask_ne = u32::from_str_radix(cols[7], 16).ok()?;
+
+        if (flags & RTF_UP) == 0 {
+            continue;
+        }
+
+        let dest = Ipv4Addr::from(dest_ne.to_ne_bytes());
+        let gw = Ipv4Addr::from(gw_ne.to_ne_bytes());
+        let mask = Ipv4Addr::from(mask_ne.to_ne_bytes());
+
+        if (flags & RTF_GATEWAY) != 0 && !gw.is_unspecified() && fallback_gw.is_none() {
+            fallback_gw = Some(gw);
+        }
+
+        let dest_u32 = u32::from(dest);
+        let mask_u32 = u32::from(mask);
+        if (target_u32 & mask_u32) == (dest_u32 & mask_u32) {
+            let prefix_len = mask_u32.count_ones();
+            let next_hop = if (flags & RTF_GATEWAY) != 0 && !gw.is_unspecified() {
+                gw
+            } else {
+                probe_target
+            };
+            let replace = match best_match {
+                None => true,
+                Some((best_plen, best_metric, _)) => {
+                    prefix_len > best_plen || (prefix_len == best_plen && metric < best_metric)
+                }
+            };
+            if replace {
+                best_match = Some((prefix_len, metric, next_hop));
             }
         }
     }
+
+    best_match.map(|(_, _, nh)| nh).or(fallback_gw)
+}
+
+fn lookup_arp_mac(if_name: &str, target_ip: Option<Ipv4Addr>) -> Option<[u8; 6]> {
+    let arp = fs::read_to_string("/proc/net/arp").ok()?;
+    let target_str = target_ip.map(|ip| ip.to_string());
+
+    for line in arp.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 6 || cols[5] != if_name || cols[3] == "00:00:00:00:00:00" {
+            continue;
+        }
+        if let Some(ref ip_str) = target_str {
+            if cols[0] != ip_str {
+                continue;
+            }
+        }
+        if let Some(mac) = parse_mac(cols[3]) {
+            return Some(mac);
+        }
+    }
     None
+}
+
+fn read_gateway_mac(if_name: &str, probe_target: Ipv4Addr) -> Option<[u8; 6]> {
+    let next_hop = find_next_hop_ipv4(if_name, probe_target);
+
+    if let Some(nh_ip) = next_hop {
+        if let Some(mac) = lookup_arp_mac(if_name, Some(nh_ip)) {
+            return Some(mac);
+        }
+        // Trigger kernel ARP resolution for the next-hop gateway IP
+        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.set_ttl(1);
+            let _ = sock.send_to(&[0u8], SocketAddrV4::new(nh_ip, 33434));
+            thread::sleep(Duration::from_millis(25));
+        }
+        if let Some(mac) = lookup_arp_mac(if_name, Some(nh_ip)) {
+            return Some(mac);
+        }
+    }
+
+    lookup_arp_mac(if_name, None)
 }
 
 fn parse_mac(s: &str) -> Option<[u8; 6]> {

@@ -1,8 +1,8 @@
 # rudp
 
-`rudp` 是一个基于 **Linux TC (Traffic Control) eBPF** 实现的高性能、零拷贝 **UDP-to-FakeTCP** 隧道工具（支持 `x86_64` 与 `aarch64`）。
+`rudp` 是一个基于 **Linux TC (Traffic Control) eBPF** 实现的高性能、零拷贝 **UDP-to-FakeTCP** 隧道与混淆工具（支持 `x86_64` 与 `aarch64`）。
 
-它专为突破运营商对 UDP 流量的 QoS 限速或阻断而设计（例如加速 WireGuard 等 UDP 协议）。与传统的基于用户态 `TUN` 虚拟网卡 + `iptables/nftables` NAT 的方案（如 `phantun`）不同，`rudp` 直接在 Linux 内核网卡驱动层与协议栈交界处（TC Ingress / Egress）对 `sk_buff` 进行**原地（In-Place）协议头改写**，无需创建虚拟网卡、无需配置任何防火墙规则、且数据面零用户态拷贝。
+它专为突破运营商对 UDP 流量的 QoS 限速或阻断而设计（例如加速 WireGuard 等 UDP 协议）。与传统的基于用户态 `TUN` 虚拟网卡 + `iptables/nftables` NAT 的方案不同，`rudp` 直接在 Linux 内核网卡驱动层与协议栈交界处（TC Ingress / Egress）对 `sk_buff` 进行**原地（In-Place）协议头改写**，无需创建虚拟网卡、无需配置任何防火墙规则、且数据面零用户态拷贝。
 
 ---
 
@@ -11,9 +11,12 @@
 - **全内核态零拷贝数据面（Zero-Copy TC eBPF）**：
   - 使用 `bpf_skb_adjust_room(..., BPF_ADJ_ROOM_NET, 0)` 直接在内核 `sk_buff` 中将 8 字节 UDP 头原地替换为 `20B TCP 头 + 随机 Padding`（反之亦然）。
   - 消除 `TUN` 虚拟网卡上下文切换（内核 $\leftrightarrow$ 用户态来回拷贝），CPU 开销与转发延迟显著降低。
-- **免 `TUN` 网卡、免 `iptables`/`nftables`**：
-  - 自动探测出口网卡 IPv4 地址、本机 MAC 与默认网关 MAC（读取 `/proc/net/route` 与 `/proc/net/arp`，必要时自动触发 UDP 探测解析 ARP）。
-  - 通过 TC filter 优先级（`priority = local_port`）自动挂载与精确卸载，不污染宿主机路由表或防火墙规则。
+- **透明接管模式（`--transparent`，零配置改动接管现有 WireGuard）**：
+  - 客户端支持挂载 `TC Egress` + `TC Ingress` 直接拦截发往远端 `<server_ip>:<port>` 的 UDP 流量并原地改写为 Fake-TCP。
+  - **无需修改现有 WireGuard 客户端的 `Endpoint` 配置，无需重启 WireGuard**，随时启动 `rudp_client -r <server_ip>:<port> --transparent` 即可无缝接管，停止进程后自动恢复原生 UDP 通信。
+- **支持本机代理、局域网网关与公网中转全场景**：
+  - 自动解析 `/proc/net/route` 最长前缀匹配下一跳网关 IP，并通过 `/proc/net/arp`（冷缓存时自动发送 TTL=1 探测触发 ARP）精确获取网关 MAC。
+  - 在 `conn_state` 中记录客户端真实二层源 MAC 与原始目标 IP（`orig_dst_ip`），下行回包自动判断目标为本机协议栈（`TC_ACT_OK` / `lo`）或外部局域网设备（Hairpin Redirect）。
 - **内核级 0-RTT 握手响应与即时 `RST` 自愈**：
   - `rudp_server` 在 `TC Ingress` 内核态直接拦截 TCP `SYN` 并原地翻转为 `SYN+ACK`（通过 `bpf_redirect` 直接从网卡发回），无需唤醒用户态。
   - 当服务端重启或连接过期后收到旧连接的未知数据包时，内核直接在 `TC Ingress` 原地回发 `TCP RST|ACK`，客户端在 `TC Ingress` 收到 `RST` 后立即清除旧状态并自动发起重新握手，无需苦等超时。
@@ -24,33 +27,51 @@
 - **四重连接状态回收机制**：
   - 内核 `BPF_MAP_TYPE_LRU_HASH`（容量 4096）自动淘汰最久未活跃连接 + 用户态每 5 秒巡检清理超 180 秒空闲连接并主动发送 `TCP RST|ACK` + 内核快路径超时拦截 + 进程退出（`SIGTERM`/`SIGINT`）优雅发送 `RST` 并卸载 TC 钩子。
 - **抗 DPI 深度包检测与流量混淆**：
-  - 支持随机长度载荷填充（`--payload-padding`）、真实 TCP 扩展头与标志位（`--tcp-extensions`）、以及内核态 `bpf_clone_redirect` 概率性注入纯随机混淆包（`--obfuscate`）。
+  - 支持随机长度载荷填充（`--payload-padding`）、真实 TCP 扩展头与标志位（`--tcp-extensions`）、以及内核态 `bpf_clone_redirect` 概率性注入自定义最大长度（`1..=255` 字节）的纯随机混淆包（`--obfuscate`）。
 
 ---
 
 ## 架构与数据流设计
 
-### 1. 整体拓扑
+### 1. 拓扑模式
 
+#### 模式 A：透明接管模式（`--transparent`，推荐用于客户端本机或局域网软路由）
+WireGuard 客户端保持原有配置 `Endpoint = server.example:12345` 完全不变：
+```text
+[Client Host]                                                      [Server Host]
++-------------------+   UDP (dst=server:12345)   +--------------+         Fake-TCP         +---------------+   UDP (12345)
+|  wg0 (:12345)     | -------------------------> | rudp_client  | <======================> |  rudp_server  | <-------------> [ wg0 (:12345) ]
+| (Endpoint Untouched)| <------------------------- | (TC Egress / |    server.example:12345  | (TC In/Egress)|
++-------------------+   UDP (src=server:12345)   |  TC Ingress) |                          +---------------+
+```
+
+#### 模式 B：传统端口代理 / 中转模式
+在中转机或本机监听指定 UDP 端口（如 `0.0.0.0:9283`），上游客户端将 `Endpoint` 指向中转端口：
 ```text
 +-------------------+         UDP          +-------------------+        Fake-TCP        +-------------------+    UDP (0.0.0.0:22809)
 |  WireGuard Client | <------------------> |    rudp_client    | <====================> |    rudp_server    | <--------------------> [ wg0 ]
-|  (Any OS / NAT)   |   ali.example:9283   | (TC Ingress Hairpin)|   server.example:928  | (TC Ingress/Egress)|
+|  (Any OS / NAT)   |   relay.example:9283 | (TC Ingress Hairpin)|   server.example:928  | (TC Ingress/Egress)|
 +-------------------+                      +-------------------+                        +-------------------+
 ```
 
 ### 2. 客户端 (`rudp_client`) 数据路径
 
-`rudp_client` 仅需在网卡挂载 **`TC Ingress`** 钩子（`rudp_client_ingress`），利用内核 Hairpin Redirect（`bpf_redirect(skb->ifindex, 0)`）直接在单张网卡上完成入站拦截与改写转发：
-
-1. **首个 UDP 包（握手慢路径）**：
-   - 当某 `(udp_client_ip, udp_client_port)` 的第一个 UDP 包到达 `eth0` 时，`CLIENT_BY_UDP` BPF Map 中尚无记录，eBPF 返回 `TC_ACT_UNSPEC` 将该包交给用户态 `UdpSocket`。
-   - 用户态分配一个未占用的本地 TCP 端口 `local_tcp_port`（`32768..=60999`），写入 `CLIENT_CONNS`（状态为 `STATE_SYN_SENT`），并通过 `AF_INET, SOCK_RAW, IPPROTO_RAW` 发送 `TCP SYN`（支持 1s 间隔自动重传，最多 6 次）。
+1. **首个 UDP 包（非阻塞握手慢路径）**：
+   - 当某 `(udp_client_ip, udp_client_port)` 的首个 UDP 包到达时，`CLIENT_BY_UDP` BPF Map 中尚无记录：
+     - 在传统代理模式下，数据包交由绑定在 `local_port` 的用户态 `UdpSocket`；
+     - 在 `--transparent` 透明模式下，`rudp_client` 自动绑定不与本机 WireGuard 冲突的空闲端口 `internal_udp_port`，eBPF 将未建立连接的首包重定向至 `internal_udp_port`。
+   - 用户态分配未占用的本地 TCP 端口 `local_tcp_port`（`32768..=60999`），记录原始目标 IP `orig_dst_ip` 写入 `CLIENT_CONNS`（状态为 `STATE_SYN_SENT`），并通过 `RawTcpSocket` 发送 `TCP SYN`（支持 1s 间隔自动重传，最多 6 次，握手期间缓存待发 UDP 包确保首包零丢失）。
    - 当服务端回发的 `SYN+ACK` 到达 `rudp_client_ingress` 时，**eBPF 在内核态直接将其原地翻转为 `TCP ACK` 发回服务端**，并将状态更新为 `STATE_SYN_RECEIVED`。
-   - 用户态轮询发现状态变为 `STATE_SYN_RECEIVED` 后，将握手期间缓存的首批 UDP 包通过 Raw Socket 发出，并将状态切换为 `STATE_ESTABLISHED`。
+   - 用户态轮询发现状态变为 `STATE_SYN_RECEIVED` 后，立即将握手期间缓存的首批 UDP 包通过 Raw Socket 发出，并将状态切换为 `STATE_ESTABLISHED`。
 2. **后续双向数据包（eBPF 零拷贝快路径）**：
-   - **上行（UDP $\to$ Fake-TCP）**：`rudp_client_ingress` 匹配到目的端口等于 `local_port` 且 `CLIENT_BY_UDP` 已处于 `STATE_ESTABLISHED` 时，直接通过 `bpf_skb_adjust_room` 将 UDP 头替换为 `TCP 头 + Padding`，翻转二层 MAC（本机 MAC $\to$ 网关 MAC），调用 `bpf_redirect(skb->ifindex, 0)` 直接从 `eth0` Egress 发出。
-   - **下行（Fake-TCP $\to$ UDP）**：`rudp_client_ingress` 收到来自 `remote_ip:remote_port` 的 TCP 数据包，校验并剥离 Padding（若是纯 Padding 混淆包则直接 `TC_ACT_SHOT` 丢弃），将 TCP 头缩减为 8 字节 UDP 头，目的地址改写为对应的 `(udp_client_ip, udp_client_port)`，直接从 `eth0` Hairpin 转发回客户端。
+   - **上行（UDP $\to$ Fake-TCP）**：
+     - 本机透明模式（`rudp_client_egress`）：在 `TC Egress` 拦截发往 `remote_ip:local_port` 的 UDP 包，直接通过 `bpf_skb_adjust_room` 原地将 UDP 头替换为 `TCP 头 + Padding` 后返回 `TC_ACT_OK` 发往网卡驱动。
+     - 局域网网关 / 中转模式（`rudp_client_ingress`）：在 `TC Ingress` 拦截入站 UDP 包，记录客户端源 MAC 至 `conn->peer_mac`，将二层目的 MAC 设为网关 MAC（`cfg->gateway_mac`），原地替换为 Fake-TCP 后调用 `bpf_redirect(skb->ifindex, 0)` 从网卡发出。
+   - **下行（Fake-TCP $\to$ UDP）**：
+     - `rudp_client_ingress` 收到来自 `remote_ip:remote_port` 的 TCP 数据包，校验并剥离 Padding（若是纯 Padding 混淆包则直接 `TC_ACT_SHOT` 丢弃），将 TCP 头缩减为 8 字节 UDP 头，源 IP 还原为 `conn->orig_dst_ip`：
+       - 若客户端位于本机（透明模式），直接返回 `TC_ACT_OK` 上送本机内核协议栈；
+       - 若客户端位于本机（本地 `127.0.0.1` 代理模式），通过 `bpf_redirect(1, BPF_F_INGRESS)` 送入 `lo`；
+       - 若客户端位于外部网络/局域网，目的 MAC 设为 `conn->peer_mac`，通过 `bpf_redirect(skb->ifindex, 0)` 转发回客户端。
 
 ### 3. 服务端 (`rudp_server`) 数据路径
 
@@ -63,10 +84,10 @@
    - 使用 `bpf_skb_adjust_room(skb, -shrink_len, BPF_ADJ_ROOM_NET, 0)` 将 `TCP 头 + Padding` 缩减为 8 字节 UDP 头：
      - **保留客户端原始源 IP**；
      - **UDP 源端口设为客户端的 TCP 源端口 `key.port`**；
-     - **UDP 目的端口设为后端服务端口 `remote_port`（如 WireGuard `22809`）**；
+     - **UDP 目的端口设为后端服务端口 `remote_port`（如 WireGuard `22809` 或 `12345`）**；
      - UDP 校验和置 `0`（IPv4 本地递交合法免校验），返回 `TC_ACT_OK` 交由本机协议栈直接送入 `wg0`。
 3. **下行封装（`TC Egress`：本机 UDP $\to$ Fake-TCP）**：
-   - 当本机 `wg0`（源端口 `22809`）向客户端 `(ip, port)` 发送 UDP 回包时，`rudp_server_egress` 在 `TC Egress` 拦截该包。
+   - 当本机 `wg0` 向客户端 `(ip, port)` 发送 UDP 回包时，`rudp_server_egress` 在 `TC Egress` 拦截该包。
    - 以目的 `(ip->daddr, udp->dest)` 为 Key 查询 `SERVER_CONNS`，使用 `bpf_skb_adjust_room(skb, grow_len, BPF_ADJ_ROOM_NET, 0)` 将 8 字节 UDP 头扩充为 `20B TCP 头 + 随机 Padding`，计算 IPv4 与 TCP 校验和后返回 `TC_ACT_OK` 发往网卡驱动。
 
 ---
@@ -87,7 +108,7 @@
 - **长度编码规则**：前两个字节 `b0` 与 `b1` 均为随机生成的字节，但满足：
   $$\texttt{pad\_len} = (\texttt{b0} + \texttt{b1}) \bmod 256$$
 - **正常数据包**：`pad_len` 在 `1..=padding_max_len`（默认 `1..=5`）之间随机选取，随后紧跟 `pad_len` 个随机字节，再紧跟原始 UDP 载荷。接收端验证 `tcp_payload_len > 2 + pad_len` 后剥离前 `2 + pad_len` 字节即可还原 UDP 载荷。
-- **纯混淆包（`--obfuscate`）**：当触发混淆（默认概率 `5%`）时，eBPF 先通过 `bpf_clone_redirect` 发送真实数据包，随后将当前 `skb` 截断并填充为 `tcp_payload_len == 2 + pad_len`（无 UDP 载荷）的纯随机包。接收端在内核发现 `tcp_payload_len <= 2 + pad_len` 时，仅递增 `stats->obf_rx` 计数并直接 `TC_ACT_SHOT` 丢弃，不产生任何上层开销。
+- **纯混淆包（`--obfuscate`）**：当触发混淆（默认概率 `5%`）时，eBPF 先通过 `bpf_clone_redirect` 发送真实数据包，随后在 `1..=obfuscate_max_len`（默认 `1..=255`）范围内随机选取 `dummy_pad_len`，将当前 `skb` 截断并填充为 `tcp_payload_len == 2 + dummy_pad_len`（无 UDP 载荷）的纯随机包。接收端在内核发现 `tcp_payload_len == 2 + pad_len` 时，仅递增 `stats->rx_obfuscate_pkts` 计数并直接 `TC_ACT_SHOT` 丢弃，不产生任何上层开销。
 
 ### 2. TCP 扩展伪装（`--tcp-extensions`）
 
@@ -95,19 +116,6 @@
 - 客户端发出的 `SYN` 包携带 `ECN + CWR` 标志位，并附带 12 字节标准 Linux TCP Options（`MSS 1460`、`SACK Permitted`、`NOP`、`WScale 7`、`NOP`、`NOP`）。
 - 服务端回发的 `SYN+ACK` 附带 8 字节 TCP Options（`MSS 1460`、`NOP`、`WScale 14`）。
 - 所有 Fake-TCP 数据包携带 `PSH | ACK` (`0x18`) 标志位，纯混淆包仅携带 `ACK` (`0x10`) 标志位。
-
----
-
-## 连接状态回收机制
-
-Fake-TCP 是无状态底层上的有状态伪装，当客户端网络切换（Wi-Fi/蜂窝切换）、NAT 端口漂移或一端重启时，必须回收残留连接状态。`rudp` 实现了四层保护：
-
-1. **内核 LRU 自动淘汰**：`CLIENT_CONNS`、`CLIENT_BY_UDP` 与 `SERVER_CONNS` 均采用 `BPF_MAP_TYPE_LRU_HASH`（最大 4096 条目），极端高并发下内核自动按 LRU 淘汰最老条目。
-2. **用户态定时巡检（每 5 秒）**：扫描所有连接，若 `ktime_get_ns() - last_seen_ns > 180s`，主动通过 Raw Socket 向对端发送 3 个 `TCP RST|ACK` 包，并从 BPF Map 中删除该条目。
-3. **内核态即时 `RST` 自愈**：
-   - 若 `rudp_server` 收到不在 `SERVER_CONNS` 中（例如服务端刚重启）或已超过 180 秒未活跃的 TCP 数据包，`rudp_server_ingress` 直接在内核原地构造 `TCP RST|ACK`（`seq = incoming_ack`, `ack = incoming_seq + len`）发回客户端。
-   - `rudp_client_ingress` 收到 `RST` 后立即将 `conn->state` 置为 `0`，下一个到达的 UDP 包会自动走慢路径触发重新握手，实现毫秒级断线自愈。
-4. **优雅退出清理**：收到 `SIGTERM` 或 `SIGINT` 时，遍历当前所有活跃连接发送 `TCP RST|ACK`，并仅卸载当前实例对应优先级（`priority = local_port`）的 TC filter。
 
 ---
 
@@ -121,8 +129,8 @@ Fake-TCP 是无状态底层上的有状态伪装，当客户端网络切换（Wi
 在 Linux 内核中，本机发出的 UDP 包默认带有 `skb->ip_summed = CHECKSUM_PARTIAL`（`csum_offset = 6`）。当 `TC Egress` 将 UDP 改写为 TCP（`csum_offset = 16`）时，内核的 `bpf_skb_adjust_room` 不会清除 `CHECKSUM_PARTIAL` 标记，这会导致 AWS `ena` 和 GCP `gve` 网卡驱动因硬件校验和偏移量不匹配而丢包。
 为此，`rudp` 做了两项处理：
 1. 所有包头扩缩均使用 `BPF_ADJ_ROOM_NET` 模式，确保 `skb_network_offset(skb) == 14` 与 `skb_transport_offset(skb) == 34` 始终正确。
-2. `rudp_server` 默认在启动时自动调用 `ethtool -K <iface> tx off` 关闭出口网卡的 TX 硬件校验和卸载（使所有本机发出的 UDP 包以 `CHECKSUM_NONE` 进入 `TC Egress`，并在进程退出时自动执行 `ethtool -K <iface> tx on tso on` 还原网卡卸载状态），从而兼容 AWS `ena`、GCP `gve` 等严格校验硬件卸载描述符的云厂商网卡驱动。
-   - 在不校验 `csum_offset` 的 `virtio_net` 网卡环境（如 Oracle Cloud）中，若希望保留网卡硬件 TSO 加速，可通过 `--disable-tx-offload=false`（或 `--keep-tx-offload`）关闭该行为。
+2. `rudp_server` 以及开启 `--transparent` 的 `rudp_client` 默认在启动时自动调用 `ethtool -K <iface> tx off` 关闭出口网卡的 TX 硬件校验和卸载（并在进程退出时自动执行 `ethtool -K <iface> tx on tso on` 还原网卡卸载状态），从而兼容 AWS `ena`、GCP `gve` 等严格校验硬件卸载描述符的云厂商网卡驱动。
+   - 在不校验 `csum_offset` 的 `virtio_net` 网卡环境（如 Oracle Cloud）中，若希望保留网卡硬件 TSO 加速，可通过 `--keep-tx-offload`（或 `--disable-tx-offload=false`）关闭该行为。
 
 ---
 
@@ -130,7 +138,7 @@ Fake-TCP 是无状态底层上的有状态伪装，当客户端网络切换（Wi
 
 ### 依赖要求
 - **Linux 内核**：$\ge 5.10$（需支持 TC `clsact` BPF 与 `BPF_MAP_TYPE_LRU_HASH`）
-- **编译环境**：Rust 工具链、`clang`（用于编译 `ebpf/rudp_ebpf.c` 为 `bpfel-unknown-none` 字节码，构建时由 `build.rs` 自动调用并内嵌至二进制文件中）
+- **编译环境**：Rust 工具链、`clang`（用于编译 `ebpf/rudp_ebpf.c` 为 `bpf` 字节码，构建时由 `build.rs` 自动调用并内嵌至二进制文件中）
 - **运行环境**：`ethtool`、`iproute2` (`tc`)，需要 `root` 或 `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_NET_RAW` 权限
 
 ### 本地编译
@@ -156,9 +164,9 @@ Usage: rudp_server [OPTIONS] --local <LOCAL> --remote <REMOTE>
 
 Options:
   -l, --local <LOCAL>
-          监听的本地 Fake-TCP 端口（例如: 928）
+          监听的本地 Fake-TCP 端口（例如: 12345 或 928）
   -r, --remote <REMOTE>
-          转发解封装后 UDP 包的目标地址:端口（例如: 127.0.0.1:22809）
+          转发解封装后 UDP 包的目标地址:端口（例如: 127.0.0.1:12345）
   -i, --interface <INTERFACE>
           挂载 TC eBPF 程序的网卡名称（省略则自动根据默认路由探测）
       --payload-padding
@@ -166,17 +174,17 @@ Options:
       --payload-padding-max-len <PAYLOAD_PADDING_MAX_LEN>
           数据包最大随机填充长度（1..=5）[默认: 5]
       --obfuscate
-          开启内核态随机混淆包注入 [环境变量: PHANTUN_OBFUSCATE]
+          开启内核态随机混淆包注入 [环境变量: RUDP_OBFUSCATE]
       --obfuscate-prob <OBFUSCATE_PROB>
-          每个数据包触发额外混淆包的百分比概率 [环境变量: PHANTUN_OBFUSCATE_PROB] [默认: 5.0]
+          每个数据包触发额外混淆包的百分比概率 [环境变量: RUDP_OBFUSCATE_PROB] [默认: 5.0]
       --obfuscate-max-len <OBFUSCATE_MAX_LEN>
-          混淆包最大随机填充长度（1..=255）[环境变量: PHANTUN_OBFUSCATE_MAX_LEN] [默认: 255]
+          混淆包最大随机填充长度（1..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
       --tcp-extensions
           开启真实 TCP Options 与 PSH|ACK 标志位伪装
       --disable-tx-offload [<DISABLE_TX_OFFLOAD>]
           启动时自动执行 `ethtool -K <iface> tx off`，退出时自动还原 `tx on tso on` [环境变量: RUDP_DISABLE_TX_OFFLOAD] [默认: true]
       --keep-tx-offload
-          保持网卡 TX 校验和卸载与 TSO 开启（等价于 `--disable-tx-offload=false`，适用于 virtio_net 等不校验 csum_offset 的网卡）
+          保持网卡 TX 校验和卸载与 TSO 开启（等价于 `--disable-tx-offload=false`）
   -h, --help
           打印帮助信息
   -V, --version
@@ -185,13 +193,16 @@ Options:
 
 ### `rudp_client`
 ```text
-Usage: rudp_client [OPTIONS] --local <LOCAL> --remote <REMOTE>
+Usage: rudp_client [OPTIONS] --remote <REMOTE>
 
 Options:
   -l, --local <LOCAL>
-          监听的本地 UDP 地址:端口（例如: 0.0.0.0:9283）
+          普通模式下为本地监听的 UDP 地址:端口或端口（如 0.0.0.0:9283 或 9283）；
+          --transparent 模式下为要透明劫持的远端目标 UDP 端口（可省略，默认等于 --remote 的端口）
   -r, --remote <REMOTE>
-          远端 rudp_server 的域名或 IP:端口（例如: example.com:928）
+          远端 rudp_server 的域名或 IP:端口（例如: example.com:12345）
+  -t, --transparent
+          开启透明接管模式：自动劫持发往 <remote_ip>:<local_port> 的 UDP 包，无需修改客户端 Endpoint [环境变量: RUDP_TRANSPARENT]
   -i, --interface <INTERFACE>
           挂载 TC eBPF 程序的网卡名称（省略则自动根据默认路由探测）
       --payload-padding
@@ -199,13 +210,17 @@ Options:
       --payload-padding-max-len <PAYLOAD_PADDING_MAX_LEN>
           数据包最大随机填充长度（1..=5）[默认: 5]
       --obfuscate
-          开启内核态随机混淆包注入 [环境变量: PHANTUN_OBFUSCATE]
+          开启内核态随机混淆包注入 [环境变量: RUDP_OBFUSCATE]
       --obfuscate-prob <OBFUSCATE_PROB>
-          每个数据包触发额外混淆包的百分比概率 [环境变量: PHANTUN_OBFUSCATE_PROB] [默认: 5.0]
+          每个数据包触发额外混淆包的百分比概率 [环境变量: RUDP_OBFUSCATE_PROB] [默认: 5.0]
       --obfuscate-max-len <OBFUSCATE_MAX_LEN>
-          混淆包最大随机填充长度（1..=255）[环境变量: PHANTUN_OBFUSCATE_MAX_LEN] [默认: 255]
+          混淆包最大随机填充长度（1..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
       --tcp-extensions
           开启真实 TCP Options 与 PSH|ACK 标志位伪装
+      --disable-tx-offload [<DISABLE_TX_OFFLOAD>]
+          透明模式下启动时自动执行 `ethtool -K <iface> tx off`，退出时自动还原 `tx on tso on` [环境变量: RUDP_DISABLE_TX_OFFLOAD] [默认: true]
+      --keep-tx-offload
+          保持网卡 TX 校验和卸载与 TSO 开启（等价于 `--disable-tx-offload=false`）
   -h, --help
           打印帮助信息
   -V, --version
@@ -216,9 +231,9 @@ Options:
 
 ## Systemd 部署示例
 
-### 1. 服务端 (`/etc/systemd/system/rudp.service`)
+### 1. 服务端 (`/etc/systemd/system/rudp-server.service`)
 
-将公网 TCP `928` 端口收到的 Fake-TCP 流量解封装转发至本机 WireGuard `22809` 端口：
+假设服务端 WireGuard 监听在 UDP `12345` 端口，启动 `rudp_server` 在 TCP `12345` 端口接收 Fake-TCP 并解封装至本机 UDP `12345`：
 
 ```ini
 [Unit]
@@ -229,9 +244,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment="RUST_LOG=info"
-Environment="PHANTUN_OBFUSCATE_PROB=5"
-Environment="PHANTUN_OBFUSCATE_MAX_LEN=32"
-ExecStart=/usr/local/bin/rudp_server --local 928 --remote 127.0.0.1:22809 --payload-padding --tcp-extensions --obfuscate
+Environment="RUDP_OBFUSCATE_PROB=5"
+Environment="RUDP_OBFUSCATE_MAX_LEN=32"
+ExecStart=/usr/local/bin/rudp_server --local 12345 --remote 127.0.0.1:12345 --payload-padding --tcp-extensions --obfuscate
 Restart=always
 RestartSec=2
 LimitMEMLOCK=infinity
@@ -240,21 +255,45 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 ```
 
-### 2. 客户端 / 中转端 (`/etc/systemd/system/rudp-jp.service`)
+### 2. 客户端：透明接管模式 (`/etc/systemd/system/rudp-client.service`)
 
-在中转机或客户端监听 UDP `0.0.0.0:9283`，封装为 Fake-TCP 发往远端 `rudp_server`（同一台机器可按不同本地端口部署多个服务，如 `9281`、`9282`、`9283`）：
+客户端 WireGuard 配置保持 `Endpoint = jp.example.com:12345` 不变，`rudp_client` 使用 `--transparent` 自动接管所有发往 `jp.example.com:12345` 的 UDP 包：
 
 ```ini
 [Unit]
-Description=rudp eBPF client (JP)
+Description=rudp eBPF transparent client
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 Environment="RUST_LOG=info"
-Environment="PHANTUN_OBFUSCATE_PROB=5"
-Environment="PHANTUN_OBFUSCATE_MAX_LEN=32"
+Environment="RUDP_OBFUSCATE_PROB=5"
+Environment="RUDP_OBFUSCATE_MAX_LEN=32"
+ExecStart=/usr/local/bin/rudp_client --remote jp.example.com:12345 --transparent --payload-padding --tcp-extensions --obfuscate
+Restart=always
+RestartSec=2
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 3. 客户端：传统中转代理模式 (`/etc/systemd/system/rudp-relay.service`)
+
+在中转机上监听本地 UDP `0.0.0.0:9283`，封装为 Fake-TCP 发往远端 `jp.example.com:928`：
+
+```ini
+[Unit]
+Description=rudp eBPF relay client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="RUST_LOG=info"
+Environment="RUDP_OBFUSCATE_PROB=5"
+Environment="RUDP_OBFUSCATE_MAX_LEN=32"
 ExecStart=/usr/local/bin/rudp_client --local 0.0.0.0:9283 --remote jp.example.com:928 --payload-padding --tcp-extensions --obfuscate
 Restart=always
 RestartSec=2
@@ -264,10 +303,10 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 ```
 
-启用并查看运行状态与 eBPF 统计日志：
+---
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now rudp.service
-sudo journalctl -u rudp.service -f
-```
+## TODO
+
+- [ ] **大包（>1500B MTU / GRO / GSO）L4 校验和支持**：当前 `ebpf/rudp_ebpf.c` 中的 `compute_l4_csum` 循环上限为 `750` 次（对应 L4 最大长度 `1500` 字节）。在开启 Jumbo Frame 或 GRO/GSO 聚合大包场景下，超过 1500B 的 L4 载荷校验和会被截断，后续可改为基于 `bpf_csum_diff` / `bpf_l4_csum_replace` 的增量校验和更新以彻底解除帧长限制。
+- [ ] **服务端下行混淆包注入**：目前 `--obfuscate` 随机混淆包注入仅在客户端上行（`rudp_client_ingress` / `rudp_client_egress`）生效，后续可在 `rudp_server_egress` 中补全对称的下行混淆包注入。
+- [ ] **IPv6 支持**：扩展 `ETH_P_IPV6` 与 IPv6 头部原地改写支持。

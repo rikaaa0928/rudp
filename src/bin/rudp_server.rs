@@ -16,7 +16,7 @@ const CONN_TIMEOUT_NS: u64 = 180_000_000_000;
 #[derive(Parser, Debug)]
 #[command(name = "rudp_server", version, about = "eBPF-accelerated FakeTCP-to-UDP Server")]
 struct Args {
-    /// Local TCP port to listen on
+    /// Local Fake-TCP port to listen on
     #[arg(short = 'l', long = "local")]
     local: u16,
 
@@ -37,15 +37,15 @@ struct Args {
     payload_padding_max_len: u8,
 
     /// Occasionally send dummy obfuscation packets
-    #[arg(long = "obfuscate", env = "PHANTUN_OBFUSCATE", default_value_t = false)]
+    #[arg(long = "obfuscate", env = "RUDP_OBFUSCATE", default_value_t = false)]
     obfuscate: bool,
 
     /// Probability (in percent) to send an obfuscation packet
-    #[arg(long = "obfuscate-prob", env = "PHANTUN_OBFUSCATE_PROB", default_value_t = 5.0)]
+    #[arg(long = "obfuscate-prob", env = "RUDP_OBFUSCATE_PROB", default_value_t = 5.0)]
     obfuscate_prob: f64,
 
-    /// Maximum random padding length for an obfuscation packet
-    #[arg(long = "obfuscate-max-len", env = "PHANTUN_OBFUSCATE_MAX_LEN", default_value_t = 255)]
+    /// Maximum random padding length for an obfuscation packet (1..=255)
+    #[arg(long = "obfuscate-max-len", env = "RUDP_OBFUSCATE_MAX_LEN", default_value_t = 255)]
     obfuscate_max_len: u8,
 
     /// Use realistic TCP options and PSH|ACK flags
@@ -66,18 +66,6 @@ struct Args {
     /// Shorthand to keep NIC TX checksum offload and TSO enabled (equivalent to --disable-tx-offload=false)
     #[arg(long = "keep-tx-offload", default_value_t = false)]
     keep_tx_offload: bool,
-
-    /// Compatibility flags with phantun CLI (ignored in eBPF mode)
-    #[arg(long = "accept-nonzero-syn-seq", default_value_t = false)]
-    accept_nonzero_syn_seq: bool,
-    #[arg(long = "tun", default_value = "")]
-    tun: String,
-    #[arg(long = "tun-local", default_value = "")]
-    tun_local: String,
-    #[arg(long = "tun-peer", default_value = "")]
-    tun_peer: String,
-    #[arg(short = '4', long = "ipv4-only", default_value_t = false)]
-    ipv4_only: bool,
 }
 
 #[tokio::main]
@@ -113,10 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         obfuscate_enabled: u8::from(args.obfuscate),
         tcp_extensions: u8::from(args.tcp_extensions),
         obfuscate_prob_bp: ((args.obfuscate_prob.clamp(0.0, 100.0)) * 100.0) as u32,
-        obfuscate_max_len: args.obfuscate_max_len,
+        obfuscate_max_len: args.obfuscate_max_len.max(1),
+        transparent: 0,
+        internal_udp_port: 0,
         local_mac: net_if.mac,
         gateway_mac: net_if.gateway_mac,
-        _pad: [0; 3],
     };
 
     {

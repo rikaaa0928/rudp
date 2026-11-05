@@ -32,6 +32,8 @@ typedef __u32 __wsum;
 #define ETH_P_IP        0x0800
 #define IPPROTO_TCP     6
 #define IPPROTO_UDP     17
+#define LOOPBACK_IFINDEX 1
+#define IPV4_LOOPBACK   0x7f000001U
 
 /* TCP flags */
 #define TCP_FLAG_FIN    0x01
@@ -49,6 +51,7 @@ typedef __u32 __wsum;
 #define BPF_MAP_TYPE_LRU_HASH   9
 
 #define BPF_ANY         0
+#define BPF_F_INGRESS   (1ULL << 0)
 #define BPF_ADJ_ROOM_NET 0
 #define BPF_ADJ_ROOM_MAC 1
 
@@ -154,17 +157,18 @@ struct rudp_config {
     __u32 mode;              /* 0 = client, 1 = server */
     __u32 local_ip;          /* Network byte order */
     __u32 remote_ip;         /* Network byte order */
-    __u16 local_port;        /* Host byte order */
+    __u16 local_port;        /* Host byte order (Proxy listen port or hijacked UDP target port) */
     __u16 remote_port;       /* Host byte order */
     __u8  padding_enabled;
     __u8  padding_max_len;   /* 1..=5 */
     __u8  obfuscate_enabled;
     __u8  tcp_extensions;
     __u32 obfuscate_prob_bp; /* 0..10000 (5.0% = 500) */
-    __u8  obfuscate_max_len;
+    __u8  obfuscate_max_len; /* 1..=255 */
+    __u8  transparent;       /* 1 = transparent hijack mode, 0 = standard proxy mode */
+    __u16 internal_udp_port; /* Host byte order: userspace slowpath UDP port */
     __u8  local_mac[6];
     __u8  gateway_mac[6];
-    __u8  _pad[3];
 };
 
 struct peer_key {
@@ -180,7 +184,7 @@ struct conn_state {
     __u32 seq;            /* Host byte order */
     __u32 ack;            /* Host byte order */
     __u32 state;          /* STATE_* */
-    __u32 _pad0;
+    __u32 orig_dst_ip;    /* Network byte order: original UDP destination IP */
     __u64 last_seen_ns;
     __u8  peer_mac[6];
     __u8  local_mac[6];
@@ -313,6 +317,10 @@ static __always_inline void copy_mac(__u8 dst[ETH_ALEN], const __u8 src[ETH_ALEN
     }
 }
 
+static __always_inline int has_valid_mac(const __u8 mac[ETH_ALEN]) {
+    return (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) != 0;
+}
+
 static __always_inline int store_padding(struct __sk_buff *skb, __u32 pad_len, __u32 rand_val) {
     __u8 pad_buf[8];
     __u8 b0 = 1 + ((rand_val >> 8) % 127);
@@ -340,6 +348,179 @@ static __always_inline int store_padding(struct __sk_buff *skb, __u32 pad_len, _
     default:
         return bpf_skb_store_bytes(skb, 54, pad_buf, 7, 0);
     }
+}
+
+/* Stores a dummy obfuscation payload of 2 + dummy_pad_len bytes (where dummy_pad_len is 1..=255) */
+static __always_inline int store_obfuscate_padding(
+    struct __sk_buff *skb,
+    __u32 dummy_pad_len,
+    __u32 rand_val
+) {
+    __u8 hdr[2];
+    __u8 b0 = 1 + ((rand_val >> 8) % 127);
+    __u8 b1 = (__u8)(dummy_pad_len - b0);
+    hdr[0] = b0;
+    hdr[1] = b1;
+    if (bpf_skb_store_bytes(skb, 54, hdr, 2, 0) < 0)
+        return -1;
+
+    __u32 r1 = bpf_get_prandom_u32();
+    __u32 r2 = bpf_get_prandom_u32();
+    __u32 r3 = r1 ^ 0x9e3779b9U;
+    __u32 r4 = r2 ^ 0x85ebca6bU;
+    __u32 chunk[4] = { r1, r2, r3, r4 };
+
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        __u32 off = (__u32)i * 16;
+        if (off >= dummy_pad_len)
+            break;
+        __u32 rem = dummy_pad_len - off;
+        if (rem >= 16) {
+            bpf_skb_store_bytes(skb, 56 + off, chunk, 16, 0);
+        } else {
+            if (rem >= 8) {
+                bpf_skb_store_bytes(skb, 56 + off, chunk, 8, 0);
+                off += 8;
+                rem -= 8;
+            }
+            if (rem >= 4) {
+                bpf_skb_store_bytes(skb, 56 + off, chunk, 4, 0);
+                off += 4;
+                rem -= 4;
+            }
+            if (rem >= 2) {
+                bpf_skb_store_bytes(skb, 56 + off, chunk, 2, 0);
+                off += 2;
+                rem -= 2;
+            }
+            if (rem >= 1) {
+                bpf_skb_store_bytes(skb, 56 + off, chunk, 1, 0);
+            }
+            break;
+        }
+        chunk[0] ^= r2 + (__u32)i;
+        chunk[1] ^= r1 - (__u32)i;
+    }
+    return 0;
+}
+
+/* Rewrites an established client UDP skb into Fake-TCP (with optional padding and obfuscation) */
+static __always_inline int client_encap_udp_to_faketcp(
+    struct __sk_buff *skb,
+    struct rudp_config *cfg,
+    struct rudp_stats *stats,
+    struct conn_state *conn,
+    struct ethhdr *out_eth,
+    __u32 udp_payload_len,
+    __u64 now,
+    int is_ingress
+) {
+    __u32 rand_val = bpf_get_prandom_u32();
+    __u32 pad_len = 0;
+    __u32 pad_total = 0;
+    if (cfg->padding_enabled) {
+        __u32 max_pad = cfg->padding_max_len;
+        if (max_pad < 1) max_pad = 1;
+        if (max_pad > 5) max_pad = 5;
+        pad_len = 1 + (rand_val % max_pad);
+        pad_total = 2 + pad_len;
+    }
+
+    __u32 tcp_payload_len = pad_total + udp_payload_len;
+    __u32 tcp_total_len = 20 + tcp_payload_len;
+    __s32 grow_len = (__s32)(12 + pad_total);
+
+    __u32 seq = __sync_fetch_and_add(&conn->seq, tcp_payload_len);
+    __u32 ack = conn->ack;
+    conn->last_seen_ns = now;
+
+    if (bpf_skb_adjust_room(skb, grow_len, BPF_ADJ_ROOM_NET, 0) < 0) {
+        __sync_fetch_and_add(&stats->drops, 1);
+        return TC_ACT_SHOT;
+    }
+
+    struct iphdr new_ip = {};
+    new_ip.version = 4;
+    new_ip.ihl = 5;
+    new_ip.tos = 0;
+    new_ip.tot_len = bpf_htons(20 + tcp_total_len);
+    new_ip.id = (__be16)(rand_val >> 16);
+    new_ip.frag_off = bpf_htons(0x4000);
+    new_ip.ttl = 64;
+    new_ip.protocol = IPPROTO_TCP;
+    new_ip.saddr = cfg->local_ip;
+    new_ip.daddr = cfg->remote_ip;
+    new_ip.check = compute_ip_csum(&new_ip);
+
+    struct tcphdr new_tcp = {};
+    new_tcp.source = conn->local_tcp_port;
+    new_tcp.dest = bpf_htons(cfg->remote_port);
+    new_tcp.seq = bpf_htonl(seq);
+    new_tcp.ack_seq = bpf_htonl(ack);
+    new_tcp.doff = 5;
+    new_tcp.flags = cfg->tcp_extensions ? (TCP_FLAG_ACK | TCP_FLAG_PSH) : TCP_FLAG_ACK;
+    new_tcp.window = bpf_htons(0xffff);
+    new_tcp.check = 0;
+    new_tcp.urg_ptr = 0;
+
+    if (out_eth) {
+        bpf_skb_store_bytes(skb, 0, out_eth, sizeof(*out_eth), 0);
+    }
+    bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
+    bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
+
+    if (cfg->padding_enabled) {
+        store_padding(skb, pad_len, rand_val);
+    }
+
+    __u16 csum = compute_l4_csum(skb, tcp_total_len, new_ip.saddr, new_ip.daddr, IPPROTO_TCP);
+    bpf_skb_store_bytes(skb, 34 + 16, &csum, sizeof(csum), 0);
+
+    __sync_fetch_and_add(&stats->tx_pkts, 1);
+    __sync_fetch_and_add(&stats->tx_bytes, udp_payload_len);
+
+    if (cfg->padding_enabled && cfg->obfuscate_enabled &&
+        (rand_val % 10000) < cfg->obfuscate_prob_bp) {
+        /* Send the real packet first via clone_redirect */
+        bpf_clone_redirect(skb, skb->ifindex, 0);
+
+        /* Turn current skb into a dummy padding-only packet of length 1..=obfuscate_max_len */
+        __u32 obf_rand = bpf_get_prandom_u32();
+        __u32 max_obf = cfg->obfuscate_max_len;
+        if (max_obf < 1) max_obf = 1;
+        if (max_obf > 255) max_obf = 255;
+        __u32 dummy_pad_len = 1 + (obf_rand % max_obf);
+        __u32 dummy_payload_len = 2 + dummy_pad_len;
+        __u32 dummy_tcp_len = 20 + dummy_payload_len;
+        __u32 dummy_seq = __sync_fetch_and_add(&conn->seq, dummy_payload_len);
+
+        if (bpf_skb_change_tail(skb, ETH_HLEN + 20 + dummy_tcp_len, 0) < 0)
+            return TC_ACT_SHOT;
+
+        new_ip.tot_len = bpf_htons(20 + dummy_tcp_len);
+        new_ip.id = (__be16)(obf_rand >> 16);
+        new_ip.check = compute_ip_csum(&new_ip);
+
+        new_tcp.seq = bpf_htonl(dummy_seq);
+        new_tcp.flags = TCP_FLAG_ACK;
+        new_tcp.check = 0;
+
+        if (out_eth) {
+            bpf_skb_store_bytes(skb, 0, out_eth, sizeof(*out_eth), 0);
+        }
+        bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
+        bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
+        if (store_obfuscate_padding(skb, dummy_pad_len, obf_rand) < 0)
+            return TC_ACT_SHOT;
+
+        __u16 dummy_csum = compute_l4_csum(skb, dummy_tcp_len, new_ip.saddr, new_ip.daddr, IPPROTO_TCP);
+        bpf_skb_store_bytes(skb, 34 + 16, &dummy_csum, sizeof(dummy_csum), 0);
+
+        __sync_fetch_and_add(&stats->tx_obfuscate_pkts, 1);
+    }
+
+    return is_ingress ? bpf_redirect(skb->ifindex, 0) : TC_ACT_OK;
 }
 
 /* ============================================================================
@@ -423,6 +604,7 @@ int rudp_server_ingress(struct __sk_buff *skb) {
         new_conn.seq = server_isn + 1;
         new_conn.ack = client_isn + 1;
         new_conn.state = STATE_ESTABLISHED;
+        new_conn.orig_dst_ip = ip->daddr;
         new_conn.last_seen_ns = bpf_ktime_get_ns();
         copy_mac(new_conn.peer_mac, eth->h_source);
         copy_mac(new_conn.local_mac, eth->h_dest);
@@ -733,15 +915,18 @@ int rudp_server_egress(struct __sk_buff *skb) {
 /* ============================================================================
  * CLIENT TC INGRESS:
  * 1. Path A (UDP from WireGuard Client -> Fake-TCP to Server):
- *    - If connection is ESTABLISHED: zero-copy rewrites UDP to Fake-TCP and
+ *    - Matches proxy packets (daddr == local_ip, dport == local_port) or
+ *      transparent gateway packets (daddr == remote_ip, dport == local_port).
+ *    - If ESTABLISHED: zero-copy rewrites UDP to Fake-TCP with gateway MAC and
  *      hairpin redirects out eth0 Egress.
- *    - If new connection: passes first UDP packet to userspace UdpSocket to
+ *    - If new connection: directs first UDP packet to userspace UdpSocket to
  *      initiate SYN handshake.
  * 2. Path B (Fake-TCP from Server -> UDP to WireGuard Client):
  *    - If SYN+ACK in SYN_SENT state: replies with TCP ACK in-place and marks
  *      connection as SYN_RECEIVED for userspace to flush first packet.
- *    - If data packet: strips Fake-TCP + padding, writes UDP header, and
- *      hairpin redirects out eth0 Egress to WireGuard Client.
+ *    - If data packet: strips Fake-TCP + padding, writes UDP header with
+ *      original source IP (orig_dst_ip), and either delivers to local stack
+ *      (if client is local) or hairpin redirects out eth0 Egress to external peer.
  * ============================================================================ */
 SEC("classifier")
 int rudp_client_ingress(struct __sk_buff *skb) {
@@ -770,7 +955,7 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         return TC_ACT_UNSPEC;
 
     /* ------------------------------------------------------------------------
-     * PATH A: Incoming UDP packet to local_port (e.g. 9283)
+     * PATH A: Incoming UDP packet matching local_port
      * ------------------------------------------------------------------------ */
     if (ip->protocol == IPPROTO_UDP && ip_hdr_len == 20) {
         struct udphdr *udp = (void *)(ip + 1);
@@ -780,6 +965,11 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         if (bpf_ntohs(udp->dest) != cfg->local_port)
             return TC_ACT_UNSPEC;
 
+        int is_transparent_pkt = (cfg->transparent && ip->daddr == cfg->remote_ip);
+        int is_proxy_pkt = (!cfg->transparent && ip->daddr == cfg->local_ip);
+        if (!is_transparent_pkt && !is_proxy_pkt)
+            return TC_ACT_UNSPEC;
+
         struct peer_key ukey = {
             .ip = ip->saddr,
             .port = udp->source,
@@ -787,15 +977,26 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         };
 
         __u32 *p_tcp_port = bpf_map_lookup_elem(&CLIENT_BY_UDP, &ukey);
-        if (!p_tcp_port)
-            return TC_ACT_UNSPEC; /* Pass to userspace UdpSocket to start handshake */
-
-        struct conn_state *conn = bpf_map_lookup_elem(&CLIENT_CONNS, p_tcp_port);
-        if (!conn)
-            return TC_ACT_UNSPEC;
-
+        struct conn_state *conn = p_tcp_port ? bpf_map_lookup_elem(&CLIENT_CONNS, p_tcp_port) : 0;
         __u64 now = bpf_ktime_get_ns();
-        if (conn->state != STATE_ESTABLISHED || (now - conn->last_seen_ns) > CONN_TIMEOUT_NS) {
+
+        if (!conn || conn->state != STATE_ESTABLISHED || (now - conn->last_seen_ns) > CONN_TIMEOUT_NS) {
+            if (is_transparent_pkt || cfg->internal_udp_port != cfg->local_port) {
+                /* Redirect transparent slowpath packet to local internal_udp_port */
+                struct ethhdr local_eth = *eth;
+                copy_mac(local_eth.h_dest, cfg->local_mac);
+                struct iphdr local_ip = *ip;
+                local_ip.daddr = cfg->local_ip;
+                local_ip.check = compute_ip_csum(&local_ip);
+                __be16 internal_port = bpf_htons(cfg->internal_udp_port);
+                __u16 zero_csum = 0;
+
+                bpf_skb_store_bytes(skb, 0, &local_eth, sizeof(local_eth), 0);
+                bpf_skb_store_bytes(skb, 14, &local_ip, sizeof(local_ip), 0);
+                bpf_skb_store_bytes(skb, 34 + 2, &internal_port, sizeof(internal_port), 0);
+                bpf_skb_store_bytes(skb, 34 + 6, &zero_csum, sizeof(zero_csum), 0);
+                return TC_ACT_OK;
+            }
             return TC_ACT_UNSPEC;
         }
 
@@ -804,104 +1005,18 @@ int rudp_client_ingress(struct __sk_buff *skb) {
             return TC_ACT_SHOT;
         __u32 udp_payload_len = ip_tot_len - 28;
 
+        /* Record upstream client's real L2 MAC for return traffic */
+        copy_mac(conn->peer_mac, eth->h_source);
+
         struct ethhdr new_eth = *eth;
-        swap_eth_mac(&new_eth);
-
-        __u32 rand_val = bpf_get_prandom_u32();
-        __u32 pad_len = 0;
-        __u32 pad_total = 0;
-        if (cfg->padding_enabled) {
-            __u32 max_pad = cfg->padding_max_len;
-            if (max_pad < 1) max_pad = 1;
-            if (max_pad > 5) max_pad = 5;
-            pad_len = 1 + (rand_val % max_pad);
-            pad_total = 2 + pad_len;
+        copy_mac(new_eth.h_source, cfg->local_mac);
+        if (has_valid_mac(cfg->gateway_mac)) {
+            copy_mac(new_eth.h_dest, cfg->gateway_mac);
+        } else {
+            copy_mac(new_eth.h_dest, eth->h_source);
         }
 
-        __u32 tcp_payload_len = pad_total + udp_payload_len;
-        __u32 tcp_total_len = 20 + tcp_payload_len;
-        __s32 grow_len = (__s32)(12 + pad_total);
-
-        __u32 seq = __sync_fetch_and_add(&conn->seq, tcp_payload_len);
-        __u32 ack = conn->ack;
-        conn->last_seen_ns = now;
-
-        if (bpf_skb_adjust_room(skb, grow_len, BPF_ADJ_ROOM_NET, 0) < 0) {
-            __sync_fetch_and_add(&stats->drops, 1);
-            return TC_ACT_SHOT;
-        }
-
-        struct iphdr new_ip = {};
-        new_ip.version = 4;
-        new_ip.ihl = 5;
-        new_ip.tos = 0;
-        new_ip.tot_len = bpf_htons(20 + tcp_total_len);
-        new_ip.id = (__be16)(rand_val >> 16);
-        new_ip.frag_off = bpf_htons(0x4000);
-        new_ip.ttl = 64;
-        new_ip.protocol = IPPROTO_TCP;
-        new_ip.saddr = cfg->local_ip;
-        new_ip.daddr = cfg->remote_ip;
-        new_ip.check = compute_ip_csum(&new_ip);
-
-        struct tcphdr new_tcp = {};
-        new_tcp.source = conn->local_tcp_port;
-        new_tcp.dest = bpf_htons(cfg->remote_port);
-        new_tcp.seq = bpf_htonl(seq);
-        new_tcp.ack_seq = bpf_htonl(ack);
-        new_tcp.doff = 5;
-        new_tcp.flags = cfg->tcp_extensions ? (TCP_FLAG_ACK | TCP_FLAG_PSH) : TCP_FLAG_ACK;
-        new_tcp.window = bpf_htons(0xffff);
-        new_tcp.check = 0;
-        new_tcp.urg_ptr = 0;
-
-        bpf_skb_store_bytes(skb, 0, &new_eth, sizeof(new_eth), 0);
-        bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
-        bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
-
-        if (cfg->padding_enabled) {
-            store_padding(skb, pad_len, rand_val);
-        }
-
-        __u16 csum = compute_l4_csum(skb, tcp_total_len, new_ip.saddr, new_ip.daddr, IPPROTO_TCP);
-        bpf_skb_store_bytes(skb, 34 + 16, &csum, sizeof(csum), 0);
-
-        __sync_fetch_and_add(&stats->tx_pkts, 1);
-        __sync_fetch_and_add(&stats->tx_bytes, udp_payload_len);
-
-        if (cfg->padding_enabled && cfg->obfuscate_enabled &&
-            (rand_val % 10000) < cfg->obfuscate_prob_bp) {
-            /* Send the real packet first via clone_redirect */
-            bpf_clone_redirect(skb, skb->ifindex, 0);
-
-            /* Turn current skb into a dummy padding-only packet (4B pad -> 6B payload) */
-            __u32 dummy_pad_len = 4;
-            __u32 dummy_payload_len = 2 + dummy_pad_len;
-            __u32 dummy_tcp_len = 20 + dummy_payload_len;
-            __u32 dummy_seq = __sync_fetch_and_add(&conn->seq, dummy_payload_len);
-
-            if (bpf_skb_change_tail(skb, ETH_HLEN + 20 + dummy_tcp_len, 0) < 0)
-                return TC_ACT_SHOT;
-
-            new_ip.tot_len = bpf_htons(20 + dummy_tcp_len);
-            new_ip.id = (__be16)bpf_get_prandom_u32();
-            new_ip.check = compute_ip_csum(&new_ip);
-
-            new_tcp.seq = bpf_htonl(dummy_seq);
-            new_tcp.check = 0;
-
-            bpf_skb_store_bytes(skb, 0, &new_eth, sizeof(new_eth), 0);
-            bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
-            bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
-            store_padding(skb, dummy_pad_len, bpf_get_prandom_u32());
-
-            __u16 dummy_csum = compute_l4_csum(skb, dummy_tcp_len, new_ip.saddr, new_ip.daddr, IPPROTO_TCP);
-            bpf_skb_store_bytes(skb, 34 + 16, &dummy_csum, sizeof(dummy_csum), 0);
-
-            __sync_fetch_and_add(&stats->tx_obfuscate_pkts, 1);
-        }
-
-        return bpf_redirect(skb->ifindex, 0);
+        return client_encap_udp_to_faketcp(skb, cfg, stats, conn, &new_eth, udp_payload_len, now, 1);
     }
 
     /* ------------------------------------------------------------------------
@@ -961,7 +1076,12 @@ int rudp_client_ingress(struct __sk_buff *skb) {
             __sync_fetch_and_add(&stats->handshakes, 1);
 
             struct ethhdr ack_eth = *eth;
-            swap_eth_mac(&ack_eth);
+            copy_mac(ack_eth.h_source, cfg->local_mac);
+            if (has_valid_mac(cfg->gateway_mac)) {
+                copy_mac(ack_eth.h_dest, cfg->gateway_mac);
+            } else {
+                copy_mac(ack_eth.h_dest, eth->h_source);
+            }
 
             struct iphdr ack_ip = {};
             ack_ip.version = 4;
@@ -1036,11 +1156,12 @@ int rudp_client_ingress(struct __sk_buff *skb) {
             return TC_ACT_SHOT;
         }
 
-        struct ethhdr out_eth = *eth;
-        swap_eth_mac(&out_eth);
-
+        struct ethhdr orig_eth = *eth;
         __be32 client_ip = conn->client_ip;
         __be16 client_port = conn->client_port;
+        __be32 src_ip = conn->orig_dst_ip
+            ? conn->orig_dst_ip
+            : (cfg->transparent ? cfg->remote_ip : cfg->local_ip);
 
         __s32 shrink_len = (__s32)(ip_hdr_len + tcp_hdr_len + pad_total) - 28;
         if (bpf_skb_adjust_room(skb, -shrink_len, BPF_ADJ_ROOM_NET, 0) < 0) {
@@ -1057,7 +1178,7 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         new_ip.frag_off = bpf_htons(0x4000);
         new_ip.ttl = 64;
         new_ip.protocol = IPPROTO_UDP;
-        new_ip.saddr = cfg->local_ip;
+        new_ip.saddr = src_ip;
         new_ip.daddr = client_ip;
         new_ip.check = compute_ip_csum(&new_ip);
 
@@ -1066,6 +1187,35 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         new_udp.dest = client_port;
         new_udp.len = bpf_htons(8 + udp_payload_len);
         new_udp.check = 0;
+
+        __sync_fetch_and_add(&stats->rx_pkts, 1);
+        __sync_fetch_and_add(&stats->rx_bytes, udp_payload_len);
+
+        /* Case 1: Local client in transparent mode (saddr == remote_ip, daddr == local_ip) */
+        if (client_ip == cfg->local_ip && src_ip == cfg->remote_ip) {
+            bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
+            bpf_skb_store_bytes(skb, 34, &new_udp, sizeof(new_udp), 0);
+            return TC_ACT_OK;
+        }
+
+        /* Case 2: Local client in proxy mode (127.0.0.1 or local_ip -> local_ip) */
+        if (client_ip == bpf_htonl(IPV4_LOOPBACK) || client_ip == cfg->local_ip) {
+            struct ethhdr lo_eth = {};
+            lo_eth.h_proto = bpf_htons(ETH_P_IP);
+            bpf_skb_store_bytes(skb, 0, &lo_eth, sizeof(lo_eth), 0);
+            bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
+            bpf_skb_store_bytes(skb, 34, &new_udp, sizeof(new_udp), 0);
+            return bpf_redirect(LOOPBACK_IFINDEX, BPF_F_INGRESS);
+        }
+
+        /* Case 3: External / LAN UDP client -> hairpin out eth0 */
+        struct ethhdr out_eth = orig_eth;
+        copy_mac(out_eth.h_source, cfg->local_mac);
+        if (has_valid_mac(conn->peer_mac)) {
+            copy_mac(out_eth.h_dest, conn->peer_mac);
+        } else {
+            copy_mac(out_eth.h_dest, orig_eth.h_source);
+        }
 
         bpf_skb_store_bytes(skb, 0, &out_eth, sizeof(out_eth), 0);
         bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
@@ -1076,13 +1226,96 @@ int rudp_client_ingress(struct __sk_buff *skb) {
             udp_csum = 0xffff;
         bpf_skb_store_bytes(skb, 34 + 6, &udp_csum, sizeof(udp_csum), 0);
 
-        __sync_fetch_and_add(&stats->rx_pkts, 1);
-        __sync_fetch_and_add(&stats->rx_bytes, udp_payload_len);
-
         return bpf_redirect(skb->ifindex, 0);
     }
 
     return TC_ACT_UNSPEC;
+}
+
+/* ============================================================================
+ * CLIENT TC EGRESS:
+ * Transparent mode hook for locally originated UDP packets (e.g. local wg0)
+ * destined to remote_ip:local_port:
+ * - If ESTABLISHED: rewrites UDP to Fake-TCP in-place on Egress (zero-copy).
+ * - If not yet ESTABLISHED: redirects packet via loopback ingress to userspace
+ *   internal_udp_port to initiate non-blocking TCP SYN handshake without dropping
+ *   the first packet.
+ * ============================================================================ */
+SEC("classifier")
+int rudp_client_egress(struct __sk_buff *skb) {
+    __u32 zero = 0;
+    struct rudp_config *cfg = bpf_map_lookup_elem(&RUDP_CFG, &zero);
+    struct rudp_stats *stats = bpf_map_lookup_elem(&RUDP_STATS, &zero);
+    if (!cfg || !stats || !cfg->transparent)
+        return TC_ACT_UNSPEC;
+
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return TC_ACT_UNSPEC;
+
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return TC_ACT_UNSPEC;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return TC_ACT_UNSPEC;
+
+    if (ip->protocol != IPPROTO_UDP)
+        return TC_ACT_UNSPEC;
+
+    __u32 ip_hdr_len = (__u32)ip->ihl * 4;
+    if (ip_hdr_len != 20)
+        return TC_ACT_UNSPEC;
+
+    if (ip->daddr != cfg->remote_ip)
+        return TC_ACT_UNSPEC;
+
+    struct udphdr *udp = (void *)(ip + 1);
+    if ((void *)(udp + 1) > data_end)
+        return TC_ACT_UNSPEC;
+
+    if (bpf_ntohs(udp->dest) != cfg->local_port)
+        return TC_ACT_UNSPEC;
+
+    struct peer_key ukey = {
+        .ip = ip->saddr,
+        .port = udp->source,
+        ._pad = 0,
+    };
+
+    __u32 *p_tcp_port = bpf_map_lookup_elem(&CLIENT_BY_UDP, &ukey);
+    struct conn_state *conn = p_tcp_port ? bpf_map_lookup_elem(&CLIENT_CONNS, p_tcp_port) : 0;
+    __u64 now = bpf_ktime_get_ns();
+
+    if (!conn || conn->state != STATE_ESTABLISHED || (now - conn->last_seen_ns) > CONN_TIMEOUT_NS) {
+        /* Redirect slowpath packet to userspace internal_udp_port via loopback */
+        struct ethhdr lo_eth = {};
+        lo_eth.h_proto = bpf_htons(ETH_P_IP);
+
+        struct iphdr lo_ip = *ip;
+        lo_ip.daddr = cfg->local_ip;
+        lo_ip.check = compute_ip_csum(&lo_ip);
+
+        __be16 internal_port = bpf_htons(cfg->internal_udp_port);
+        __u16 zero_csum = 0;
+
+        bpf_skb_store_bytes(skb, 0, &lo_eth, sizeof(lo_eth), 0);
+        bpf_skb_store_bytes(skb, 14, &lo_ip, sizeof(lo_ip), 0);
+        bpf_skb_store_bytes(skb, 34 + 2, &internal_port, sizeof(internal_port), 0);
+        bpf_skb_store_bytes(skb, 34 + 6, &zero_csum, sizeof(zero_csum), 0);
+
+        return bpf_redirect(LOOPBACK_IFINDEX, BPF_F_INGRESS);
+    }
+
+    __u32 ip_tot_len = bpf_ntohs(ip->tot_len);
+    if (ip_tot_len <= 28)
+        return TC_ACT_SHOT;
+    __u32 udp_payload_len = ip_tot_len - 28;
+
+    return client_encap_udp_to_faketcp(skb, cfg, stats, conn, 0, udp_payload_len, now, 0);
 }
 
 char _license[] SEC("license") = "Dual MIT/GPL";
