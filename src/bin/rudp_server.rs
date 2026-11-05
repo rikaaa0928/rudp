@@ -185,8 +185,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(s) = stats_map.get(&0, 0) {
                         if s.rx_pkts != last_stats.rx_pkts || s.tx_pkts != last_stats.tx_pkts || s.handshakes != last_stats.handshakes {
                             info!(
-                                "eBPF stats: handshakes={} rx_pkts={} ({} B) tx_pkts={} ({} B) obf_rx={} drops={}",
-                                s.handshakes, s.rx_pkts, s.rx_bytes, s.tx_pkts, s.tx_bytes, s.rx_obfuscate_pkts, s.drops
+                                "eBPF stats: handshakes={} rx_pkts={} ({} B) tx_pkts={} ({} B) obf_tx={} obf_rx={} drops={}",
+                                s.handshakes, s.rx_pkts, s.rx_bytes, s.tx_pkts, s.tx_bytes, s.tx_obfuscate_pkts, s.rx_obfuscate_pkts, s.drops
                             );
                             last_stats = s;
                         }

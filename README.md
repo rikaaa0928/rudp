@@ -308,5 +308,4 @@ WantedBy=multi-user.target
 ## TODO
 
 - [ ] **大包（>1500B MTU / GRO / GSO）L4 校验和支持**：当前 `ebpf/rudp_ebpf.c` 中的 `compute_l4_csum` 循环上限为 `750` 次（对应 L4 最大长度 `1500` 字节）。在开启 Jumbo Frame 或 GRO/GSO 聚合大包场景下，超过 1500B 的 L4 载荷校验和会被截断，后续可改为基于 `bpf_csum_diff` / `bpf_l4_csum_replace` 的增量校验和更新以彻底解除帧长限制。
-- [ ] **服务端下行混淆包注入**：目前 `--obfuscate` 随机混淆包注入仅在客户端上行（`rudp_client_ingress` / `rudp_client_egress`）生效，后续可在 `rudp_server_egress` 中补全对称的下行混淆包注入。
 - [ ] **IPv6 支持**：扩展 `ETH_P_IPV6` 与 IPv6 头部原地改写支持。

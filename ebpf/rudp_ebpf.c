@@ -909,6 +909,43 @@ int rudp_server_egress(struct __sk_buff *skb) {
     __sync_fetch_and_add(&stats->tx_pkts, 1);
     __sync_fetch_and_add(&stats->tx_bytes, udp_payload_len);
 
+    if (cfg->padding_enabled && cfg->obfuscate_enabled &&
+        (rand_val % 10000) < cfg->obfuscate_prob_bp) {
+        /* Send the real packet first via clone_redirect */
+        bpf_clone_redirect(skb, skb->ifindex, 0);
+
+        /* Turn current skb into a dummy padding-only packet of length 1..=obfuscate_max_len */
+        __u32 obf_rand = bpf_get_prandom_u32();
+        __u32 max_obf = cfg->obfuscate_max_len;
+        if (max_obf < 1) max_obf = 1;
+        if (max_obf > 255) max_obf = 255;
+        __u32 dummy_pad_len = 1 + (obf_rand % max_obf);
+        __u32 dummy_payload_len = 2 + dummy_pad_len;
+        __u32 dummy_tcp_len = 20 + dummy_payload_len;
+        __u32 dummy_seq = __sync_fetch_and_add(&conn->seq, dummy_payload_len);
+
+        if (bpf_skb_change_tail(skb, ETH_HLEN + 20 + dummy_tcp_len, 0) < 0)
+            return TC_ACT_SHOT;
+
+        new_ip.tot_len = bpf_htons(20 + dummy_tcp_len);
+        new_ip.id = (__be16)(obf_rand >> 16);
+        new_ip.check = compute_ip_csum(&new_ip);
+
+        new_tcp.seq = bpf_htonl(dummy_seq);
+        new_tcp.flags = TCP_FLAG_ACK;
+        new_tcp.check = 0;
+
+        bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
+        bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
+        if (store_obfuscate_padding(skb, dummy_pad_len, obf_rand) < 0)
+            return TC_ACT_SHOT;
+
+        __u16 dummy_csum = compute_l4_csum(skb, dummy_tcp_len, saddr, daddr, IPPROTO_TCP);
+        bpf_skb_store_bytes(skb, 34 + 16, &dummy_csum, sizeof(dummy_csum), 0);
+
+        __sync_fetch_and_add(&stats->tx_obfuscate_pkts, 1);
+    }
+
     return TC_ACT_OK;
 }
 
