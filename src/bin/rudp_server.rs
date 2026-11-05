@@ -32,8 +32,8 @@ struct Args {
     #[arg(long = "payload-padding", default_value_t = false)]
     payload_padding: bool,
 
-    /// Maximum random padding length (1..=5)
-    #[arg(long = "payload-padding-max-len", default_value_t = 5)]
+    /// Maximum random even padding length (2..=254, rounded down to even)
+    #[arg(long = "payload-padding-max-len", default_value_t = 4)]
     payload_padding_max_len: u8,
 
     /// Occasionally send dummy obfuscation packets
@@ -44,7 +44,7 @@ struct Args {
     #[arg(long = "obfuscate-prob", env = "RUDP_OBFUSCATE_PROB", default_value_t = 5.0)]
     obfuscate_prob: f64,
 
-    /// Maximum random padding length for an obfuscation packet (1..=255)
+    /// Maximum random padding length for an obfuscation packet (4..=255)
     #[arg(long = "obfuscate-max-len", env = "RUDP_OBFUSCATE_MAX_LEN", default_value_t = 255)]
     obfuscate_max_len: u8,
 
@@ -52,7 +52,7 @@ struct Args {
     #[arg(long = "tcp-extensions", default_value_t = false)]
     tcp_extensions: bool,
 
-    /// Disable NIC TX checksum offload (`ethtool -K <iface> tx off`) on startup and restore `tx on tso on` on exit
+    /// Optionally disable NIC TX checksum offload (`ethtool -K <iface> tx off`) on startup and restore on exit
     #[arg(
         long = "disable-tx-offload",
         env = "RUDP_DISABLE_TX_OFFLOAD",
@@ -97,11 +97,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_port: args.local,
         remote_port: remote_addr.port(),
         padding_enabled: u8::from(args.payload_padding),
-        padding_max_len: args.payload_padding_max_len.clamp(1, 5),
+        padding_max_len: args.payload_padding_max_len.clamp(2, 254),
         obfuscate_enabled: u8::from(args.obfuscate),
         tcp_extensions: u8::from(args.tcp_extensions),
         obfuscate_prob_bp: ((args.obfuscate_prob.clamp(0.0, 100.0)) * 100.0) as u32,
-        obfuscate_max_len: args.obfuscate_max_len.max(1),
+        obfuscate_max_len: args.obfuscate_max_len.max(4),
         transparent: 0,
         internal_udp_port: 0,
         local_mac: net_if.mac,

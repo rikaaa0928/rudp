@@ -107,8 +107,8 @@ WireGuard 客户端保持原有配置 `Endpoint = server.example:12345` 完全�
 
 - **长度编码规则**：前两个字节 `b0` 与 `b1` 均为随机生成的字节，但满足：
   $$\texttt{pad\_len} = (\texttt{b0} + \texttt{b1}) \bmod 256$$
-- **正常数据包**：`pad_len` 在 `1..=padding_max_len`（默认 `1..=5`）之间随机选取，随后紧跟 `pad_len` 个随机字节，再紧跟原始 UDP 载荷。接收端验证 `tcp_payload_len > 2 + pad_len` 后剥离前 `2 + pad_len` 字节即可还原 UDP 载荷。
-- **纯混淆包（`--obfuscate`）**：当触发混淆（默认概率 `5%`）时，eBPF 先通过 `bpf_clone_redirect` 发送真实数据包，随后在 `1..=obfuscate_max_len`（默认 `1..=255`）范围内随机选取 `dummy_pad_len`，将当前 `skb` 截断并填充为 `tcp_payload_len == 2 + dummy_pad_len`（无 UDP 载荷）的纯随机包。接收端在内核发现 `tcp_payload_len == 2 + pad_len` 时，仅递增 `stats->rx_obfuscate_pkts` 计数并直接 `TC_ACT_SHOT` 丢弃，不产生任何上层开销。
+- **正常数据包**：`pad_len` 在 `2..=padding_max_len`（默认 `4`，取偶数，最大支持 `254`）之间随机选取，随后紧跟 `pad_len` 个随机字节，再紧跟原始 UDP 载荷。接收端验证 `tcp_payload_len > 2 + pad_len` 后剥离前 `2 + pad_len` 字节即可还原 UDP 载荷。
+- **纯混淆包（`--obfuscate`）**：当触发混淆（默认概率 `5%`）时，eBPF 先通过 `bpf_clone_redirect` 发送真实数据包，随后在 `max(4, pad_len)..=obfuscate_max_len`（默认上限 `255`）范围内随机选取 `dummy_pad_len`，将当前 `skb` 截断并填充为 `tcp_payload_len == 2 + dummy_pad_len`（无 UDP 载荷）的纯随机包。接收端在内核发现 `tcp_payload_len == 2 + pad_len` 时，仅递增 `stats->rx_obfuscate_pkts` 计数并直接 `TC_ACT_SHOT` 丢弃，不产生任何上层开销。
 
 ### 2. TCP 扩展伪装（`--tcp-extensions`）
 
@@ -172,13 +172,13 @@ Options:
       --payload-padding
           开启随机长度载荷填充头
       --payload-padding-max-len <PAYLOAD_PADDING_MAX_LEN>
-          数据包最大随机填充长度（1..=5）[默认: 5]
+          数据包最大随机偶数填充长度（2..=254）[默认: 4]
       --obfuscate
           开启内核态随机混淆包注入 [环境变量: RUDP_OBFUSCATE]
       --obfuscate-prob <OBFUSCATE_PROB>
           每个数据包触发额外混淆包的百分比概率 [环境变量: RUDP_OBFUSCATE_PROB] [默认: 5.0]
       --obfuscate-max-len <OBFUSCATE_MAX_LEN>
-          混淆包最大随机填充长度（1..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
+          混淆包最大随机填充长度（4..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
       --tcp-extensions
           开启真实 TCP Options 与 PSH|ACK 标志位伪装
       --disable-tx-offload [<DISABLE_TX_OFFLOAD>]
@@ -208,13 +208,13 @@ Options:
       --payload-padding
           开启随机长度载荷填充头
       --payload-padding-max-len <PAYLOAD_PADDING_MAX_LEN>
-          数据包最大随机填充长度（1..=5）[默认: 5]
+          数据包最大随机偶数填充长度（2..=254）[默认: 4]
       --obfuscate
           开启内核态随机混淆包注入 [环境变量: RUDP_OBFUSCATE]
       --obfuscate-prob <OBFUSCATE_PROB>
           每个数据包触发额外混淆包的百分比概率 [环境变量: RUDP_OBFUSCATE_PROB] [默认: 5.0]
       --obfuscate-max-len <OBFUSCATE_MAX_LEN>
-          混淆包最大随机填充长度（1..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
+          混淆包最大随机填充长度（4..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
       --tcp-extensions
           开启真实 TCP Options 与 PSH|ACK 标志位伪装
       --disable-tx-offload [<DISABLE_TX_OFFLOAD>]

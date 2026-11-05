@@ -145,6 +145,7 @@ static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static __u32 (*bpf_get_prandom_u32)(void) = (void *)7;
 static long (*bpf_skb_store_bytes)(struct __sk_buff *skb, __u32 offset, const void *from, __u32 len, __u64 flags) = (void *)9;
+static long (*bpf_l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) = (void *)11;
 static long (*bpf_clone_redirect)(struct __sk_buff *skb, __u32 ifindex, __u64 flags) = (void *)13;
 static long (*bpf_redirect)(__u32 ifindex, __u64 flags) = (void *)23;
 static long (*bpf_skb_load_bytes)(const struct __sk_buff *skb, __u32 offset, void *to, __u32 len) = (void *)26;
@@ -252,17 +253,18 @@ static __always_inline __u16 compute_ip_csum(struct iphdr *ip) {
     return ~(__u16)sum;
 }
 
-static __always_inline __u16 compute_l4_csum(
+static __always_inline __u16 compute_l4_csum_partial(
     struct __sk_buff *skb,
+    __u32 sum_len,
     __u32 l4_len,
     __be32 saddr,
     __be32 daddr,
     __u8 proto
 ) {
-    if (l4_len > 1500) {
-        l4_len = 1500;
+    if (sum_len > 1500) {
+        sum_len = 1500;
     }
-    __u32 total_len = 34 + l4_len;
+    __u32 total_len = 34 + sum_len;
     if (total_len <= skb->len) {
         bpf_skb_pull_data(skb, total_len);
     }
@@ -280,15 +282,15 @@ static __always_inline __u16 compute_l4_csum(
 
     for (__u32 i = 0; i < 750; i++) {
         __u32 off = 34 + i * 2;
-        if (i * 2 + 2 > l4_len)
+        if (i * 2 + 2 > sum_len)
             break;
         if (data + off + 2 > data_end)
             break;
         sum += *(__u16 *)(data + off);
     }
 
-    if (l4_len & 1) {
-        __u32 odd_off = 34 + (l4_len & 0xfffe);
+    if (sum_len & 1) {
+        __u32 odd_off = 34 + (sum_len & 0xfffe);
         if (odd_off < 1560 && data + odd_off + 1 <= data_end) {
             sum += *(__u8 *)(data + odd_off);
         }
@@ -298,6 +300,64 @@ static __always_inline __u16 compute_l4_csum(
     sum = (sum & 0xffff) + (sum >> 16);
     sum = (sum & 0xffff) + (sum >> 16);
     return ~(__u16)sum;
+}
+
+static __always_inline __u16 compute_l4_csum(
+    struct __sk_buff *skb,
+    __u32 l4_len,
+    __be32 saddr,
+    __be32 daddr,
+    __u8 proto
+) {
+    return compute_l4_csum_partial(skb, l4_len, l4_len, saddr, daddr, proto);
+}
+
+static __always_inline void finalize_tcp_csum(
+    struct __sk_buff *skb,
+    __u32 tcp_total_len,
+    __be32 saddr,
+    __be32 daddr,
+    __u32 pad_total
+) {
+    __u16 zero = 0;
+    bpf_skb_store_bytes(skb, 50, &zero, 2, 0);
+
+    if (pad_total >= 4 && (pad_total & 1) == 0) {
+        /* Probe whether skb->ip_summed == CHECKSUM_PARTIAL:
+         * bpf_l4_csum_replace without BPF_F_PSEUDO_HDR is a no-op when
+         * skb->ip_summed == CHECKSUM_PARTIAL, leaving offset 50 as 0. */
+        bpf_l4_csum_replace(skb, 50, 0, 0x1234, 2);
+        __u16 probe = 0;
+        bpf_skb_load_bytes(skb, 50, &probe, 2);
+
+        if (probe == 0) {
+            /* skb->ip_summed == CHECKSUM_PARTIAL:
+             * csum_start is at 46 + pad_total (even), and csum_pos is at 52 + pad_total.
+             * On egress, the kernel/NIC writes ~Sum(skb[csum_start..end]) into skb[csum_pos],
+             * making Sum(skb[csum_start..end]) == 0xffff (== 0 in 1's complement). */
+            __u32 csum_pos = 52 + pad_total;
+            if (pad_total == 4) {
+                /* csum_start == 50 (starts at tcp->check).
+                 * Set skb[50..52] = ~S1 and skb[56..58] = S1 so they cancel in skb[50..end]. */
+                __u16 csum = compute_l4_csum_partial(skb, 16, tcp_total_len, saddr, daddr, IPPROTO_TCP);
+                __u16 s1 = ~csum;
+                bpf_skb_store_bytes(skb, 50, &csum, 2, 0);
+                bpf_skb_store_bytes(skb, 56, &s1, 2, 0);
+                return;
+            } else {
+                /* csum_start = 46 + pad_total >= 52 (starts after tcp->check).
+                 * Zero skb[csum_pos], and set skb[50..52] = ~Sum(pseudo + skb[34..csum_start]). */
+                bpf_skb_store_bytes(skb, csum_pos, &zero, 2, 0);
+                __u16 csum = compute_l4_csum_partial(skb, 12 + pad_total, tcp_total_len, saddr, daddr, IPPROTO_TCP);
+                bpf_skb_store_bytes(skb, 50, &csum, 2, 0);
+                return;
+            }
+        }
+        bpf_skb_store_bytes(skb, 50, &zero, 2, 0);
+    }
+
+    __u16 csum = compute_l4_csum(skb, tcp_total_len, saddr, daddr, IPPROTO_TCP);
+    bpf_skb_store_bytes(skb, 50, &csum, 2, 0);
 }
 
 static __always_inline void swap_eth_mac(struct ethhdr *eth) {
@@ -321,44 +381,15 @@ static __always_inline int has_valid_mac(const __u8 mac[ETH_ALEN]) {
     return (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) != 0;
 }
 
-static __always_inline int store_padding(struct __sk_buff *skb, __u32 pad_len, __u32 rand_val) {
-    __u8 pad_buf[8];
-    __u8 b0 = 1 + ((rand_val >> 8) % 127);
-    __u8 b1 = (__u8)pad_len - b0;
-    pad_buf[0] = b0;
-    pad_buf[1] = b1;
-
-    __u32 r2 = bpf_get_prandom_u32();
-    pad_buf[2] = (__u8)(r2 & 0xff);
-    pad_buf[3] = (__u8)((r2 >> 8) & 0xff);
-    pad_buf[4] = (__u8)((r2 >> 16) & 0xff);
-    pad_buf[5] = (__u8)((r2 >> 24) & 0xff);
-    pad_buf[6] = (__u8)((rand_val >> 16) & 0xff);
-    pad_buf[7] = (__u8)((rand_val >> 24) & 0xff);
-
-    switch (pad_len) {
-    case 1:
-        return bpf_skb_store_bytes(skb, 54, pad_buf, 3, 0);
-    case 2:
-        return bpf_skb_store_bytes(skb, 54, pad_buf, 4, 0);
-    case 3:
-        return bpf_skb_store_bytes(skb, 54, pad_buf, 5, 0);
-    case 4:
-        return bpf_skb_store_bytes(skb, 54, pad_buf, 6, 0);
-    default:
-        return bpf_skb_store_bytes(skb, 54, pad_buf, 7, 0);
-    }
-}
-
-/* Stores a dummy obfuscation payload of 2 + dummy_pad_len bytes (where dummy_pad_len is 1..=255) */
-static __always_inline int store_obfuscate_padding(
+/* Stores a variable padding payload of 2 + pad_len bytes (where pad_len is 1..=255) */
+static __always_inline int store_var_padding(
     struct __sk_buff *skb,
-    __u32 dummy_pad_len,
+    __u32 pad_len,
     __u32 rand_val
 ) {
     __u8 hdr[2];
     __u8 b0 = 1 + ((rand_val >> 8) % 127);
-    __u8 b1 = (__u8)(dummy_pad_len - b0);
+    __u8 b1 = (__u8)(pad_len - b0);
     hdr[0] = b0;
     hdr[1] = b1;
     if (bpf_skb_store_bytes(skb, 54, hdr, 2, 0) < 0)
@@ -373,9 +404,9 @@ static __always_inline int store_obfuscate_padding(
     #pragma unroll
     for (int i = 0; i < 16; i++) {
         __u32 off = (__u32)i * 16;
-        if (off >= dummy_pad_len)
+        if (off >= pad_len)
             break;
-        __u32 rem = dummy_pad_len - off;
+        __u32 rem = pad_len - off;
         if (rem >= 16) {
             bpf_skb_store_bytes(skb, 56 + off, chunk, 16, 0);
         } else {
@@ -421,9 +452,10 @@ static __always_inline int client_encap_udp_to_faketcp(
     __u32 pad_total = 0;
     if (cfg->padding_enabled) {
         __u32 max_pad = cfg->padding_max_len;
-        if (max_pad < 1) max_pad = 1;
-        if (max_pad > 5) max_pad = 5;
-        pad_len = 1 + (rand_val % max_pad);
+        if (max_pad < 2) max_pad = 2;
+        if (max_pad > 254) max_pad = 254;
+        __u32 num_even = max_pad >> 1;
+        pad_len = (1 + (rand_val % num_even)) << 1;
         pad_total = 2 + pad_len;
     }
 
@@ -471,11 +503,11 @@ static __always_inline int client_encap_udp_to_faketcp(
     bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
 
     if (cfg->padding_enabled) {
-        store_padding(skb, pad_len, rand_val);
+        if (store_var_padding(skb, pad_len, rand_val) < 0)
+            return TC_ACT_SHOT;
     }
 
-    __u16 csum = compute_l4_csum(skb, tcp_total_len, new_ip.saddr, new_ip.daddr, IPPROTO_TCP);
-    bpf_skb_store_bytes(skb, 34 + 16, &csum, sizeof(csum), 0);
+    finalize_tcp_csum(skb, tcp_total_len, new_ip.saddr, new_ip.daddr, pad_total);
 
     __sync_fetch_and_add(&stats->tx_pkts, 1);
     __sync_fetch_and_add(&stats->tx_bytes, udp_payload_len);
@@ -485,12 +517,13 @@ static __always_inline int client_encap_udp_to_faketcp(
         /* Send the real packet first via clone_redirect */
         bpf_clone_redirect(skb, skb->ifindex, 0);
 
-        /* Turn current skb into a dummy padding-only packet of length 1..=obfuscate_max_len */
+        /* Turn current skb into a dummy padding-only packet of length min_obf..=max_obf */
         __u32 obf_rand = bpf_get_prandom_u32();
+        __u32 min_obf = pad_len > 4 ? pad_len : 4;
         __u32 max_obf = cfg->obfuscate_max_len;
-        if (max_obf < 1) max_obf = 1;
+        if (max_obf < min_obf) max_obf = min_obf;
         if (max_obf > 255) max_obf = 255;
-        __u32 dummy_pad_len = 1 + (obf_rand % max_obf);
+        __u32 dummy_pad_len = min_obf + (obf_rand % (max_obf - min_obf + 1));
         __u32 dummy_payload_len = 2 + dummy_pad_len;
         __u32 dummy_tcp_len = 20 + dummy_payload_len;
         __u32 dummy_seq = __sync_fetch_and_add(&conn->seq, dummy_payload_len);
@@ -511,11 +544,10 @@ static __always_inline int client_encap_udp_to_faketcp(
         }
         bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
         bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
-        if (store_obfuscate_padding(skb, dummy_pad_len, obf_rand) < 0)
+        if (store_var_padding(skb, dummy_pad_len, obf_rand) < 0)
             return TC_ACT_SHOT;
 
-        __u16 dummy_csum = compute_l4_csum(skb, dummy_tcp_len, new_ip.saddr, new_ip.daddr, IPPROTO_TCP);
-        bpf_skb_store_bytes(skb, 34 + 16, &dummy_csum, sizeof(dummy_csum), 0);
+        finalize_tcp_csum(skb, dummy_tcp_len, new_ip.saddr, new_ip.daddr, pad_total);
 
         __sync_fetch_and_add(&stats->tx_obfuscate_pkts, 1);
     }
@@ -853,9 +885,10 @@ int rudp_server_egress(struct __sk_buff *skb) {
     __u32 pad_total = 0;
     if (cfg->padding_enabled) {
         __u32 max_pad = cfg->padding_max_len;
-        if (max_pad < 1) max_pad = 1;
-        if (max_pad > 5) max_pad = 5;
-        pad_len = 1 + (rand_val % max_pad);
+        if (max_pad < 2) max_pad = 2;
+        if (max_pad > 254) max_pad = 254;
+        __u32 num_even = max_pad >> 1;
+        pad_len = (1 + (rand_val % num_even)) << 1;
         pad_total = 2 + pad_len;
     }
 
@@ -900,11 +933,11 @@ int rudp_server_egress(struct __sk_buff *skb) {
     bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
 
     if (cfg->padding_enabled) {
-        store_padding(skb, pad_len, rand_val);
+        if (store_var_padding(skb, pad_len, rand_val) < 0)
+            return TC_ACT_SHOT;
     }
 
-    __u16 csum = compute_l4_csum(skb, tcp_total_len, saddr, daddr, IPPROTO_TCP);
-    bpf_skb_store_bytes(skb, 34 + 16, &csum, sizeof(csum), 0);
+    finalize_tcp_csum(skb, tcp_total_len, saddr, daddr, pad_total);
 
     __sync_fetch_and_add(&stats->tx_pkts, 1);
     __sync_fetch_and_add(&stats->tx_bytes, udp_payload_len);
@@ -914,12 +947,13 @@ int rudp_server_egress(struct __sk_buff *skb) {
         /* Send the real packet first via clone_redirect */
         bpf_clone_redirect(skb, skb->ifindex, 0);
 
-        /* Turn current skb into a dummy padding-only packet of length 1..=obfuscate_max_len */
+        /* Turn current skb into a dummy padding-only packet of length min_obf..=max_obf */
         __u32 obf_rand = bpf_get_prandom_u32();
+        __u32 min_obf = pad_len > 4 ? pad_len : 4;
         __u32 max_obf = cfg->obfuscate_max_len;
-        if (max_obf < 1) max_obf = 1;
+        if (max_obf < min_obf) max_obf = min_obf;
         if (max_obf > 255) max_obf = 255;
-        __u32 dummy_pad_len = 1 + (obf_rand % max_obf);
+        __u32 dummy_pad_len = min_obf + (obf_rand % (max_obf - min_obf + 1));
         __u32 dummy_payload_len = 2 + dummy_pad_len;
         __u32 dummy_tcp_len = 20 + dummy_payload_len;
         __u32 dummy_seq = __sync_fetch_and_add(&conn->seq, dummy_payload_len);
@@ -937,11 +971,10 @@ int rudp_server_egress(struct __sk_buff *skb) {
 
         bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
         bpf_skb_store_bytes(skb, 34, &new_tcp, sizeof(new_tcp), 0);
-        if (store_obfuscate_padding(skb, dummy_pad_len, obf_rand) < 0)
+        if (store_var_padding(skb, dummy_pad_len, obf_rand) < 0)
             return TC_ACT_SHOT;
 
-        __u16 dummy_csum = compute_l4_csum(skb, dummy_tcp_len, saddr, daddr, IPPROTO_TCP);
-        bpf_skb_store_bytes(skb, 34 + 16, &dummy_csum, sizeof(dummy_csum), 0);
+        finalize_tcp_csum(skb, dummy_tcp_len, saddr, daddr, pad_total);
 
         __sync_fetch_and_add(&stats->tx_obfuscate_pkts, 1);
     }
@@ -1228,21 +1261,11 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         __sync_fetch_and_add(&stats->rx_pkts, 1);
         __sync_fetch_and_add(&stats->rx_bytes, udp_payload_len);
 
-        /* Case 1: Local client in transparent mode (saddr == remote_ip, daddr == local_ip) */
-        if (client_ip == cfg->local_ip && src_ip == cfg->remote_ip) {
+        /* Local client (transparent mode or local proxy mode on local_ip / 127.0.0.1) */
+        if (client_ip == cfg->local_ip || client_ip == bpf_htonl(IPV4_LOOPBACK)) {
             bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
             bpf_skb_store_bytes(skb, 34, &new_udp, sizeof(new_udp), 0);
             return TC_ACT_OK;
-        }
-
-        /* Case 2: Local client in proxy mode (127.0.0.1 or local_ip -> local_ip) */
-        if (client_ip == bpf_htonl(IPV4_LOOPBACK) || client_ip == cfg->local_ip) {
-            struct ethhdr lo_eth = {};
-            lo_eth.h_proto = bpf_htons(ETH_P_IP);
-            bpf_skb_store_bytes(skb, 0, &lo_eth, sizeof(lo_eth), 0);
-            bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
-            bpf_skb_store_bytes(skb, 34, &new_udp, sizeof(new_udp), 0);
-            return bpf_redirect(LOOPBACK_IFINDEX, BPF_F_INGRESS);
         }
 
         /* Case 3: External / LAN UDP client -> hairpin out eth0 */

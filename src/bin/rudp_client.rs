@@ -4,9 +4,10 @@ use clap::Parser;
 use log::{error, info, warn};
 use rand::Rng;
 use rudp::{
-    build_ipv4_tcp_packet, detect_interface, encode_payload, ktime_get_ns, load_ebpf, reset_clsact,
-    ConnState, PeerKey, RawTcpSocket, RudpConfig, RudpStats, STATE_ESTABLISHED,
-    STATE_SYN_RECEIVED, STATE_SYN_SENT, TCP_FLAG_ACK, TCP_FLAG_RST, TCP_FLAG_SYN,
+    build_ipv4_tcp_packet, detect_interface, enable_local_routing_sysctls, encode_payload,
+    ktime_get_ns, load_ebpf, reset_clsact, ConnState, PeerKey, RawTcpSocket, RudpConfig,
+    RudpStats, STATE_ESTABLISHED, STATE_SYN_RECEIVED, STATE_SYN_SENT, TCP_FLAG_ACK, TCP_FLAG_RST,
+    TCP_FLAG_SYN,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -51,8 +52,8 @@ struct Args {
     #[arg(long = "payload-padding", default_value_t = false)]
     payload_padding: bool,
 
-    /// Maximum random padding length (1..=5)
-    #[arg(long = "payload-padding-max-len", default_value_t = 5)]
+    /// Maximum random even padding length (2..=254, rounded down to even)
+    #[arg(long = "payload-padding-max-len", default_value_t = 4)]
     payload_padding_max_len: u8,
 
     /// Occasionally send dummy obfuscation packets
@@ -63,7 +64,7 @@ struct Args {
     #[arg(long = "obfuscate-prob", env = "RUDP_OBFUSCATE_PROB", default_value_t = 5.0)]
     obfuscate_prob: f64,
 
-    /// Maximum random padding length for an obfuscation packet (1..=255)
+    /// Maximum random padding length for an obfuscation packet (4..=255)
     #[arg(long = "obfuscate-max-len", env = "RUDP_OBFUSCATE_MAX_LEN", default_value_t = 255)]
     obfuscate_max_len: u8,
 
@@ -71,7 +72,7 @@ struct Args {
     #[arg(long = "tcp-extensions", default_value_t = false)]
     tcp_extensions: bool,
 
-    /// Disable NIC TX checksum offload (`ethtool -K <iface> tx off`) in transparent mode and restore on exit
+    /// Optionally disable NIC TX checksum offload (`ethtool -K <iface> tx off`) in transparent mode and restore on exit
     #[arg(
         long = "disable-tx-offload",
         env = "RUDP_DISABLE_TX_OFFLOAD",
@@ -148,11 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_port,
         remote_port,
         padding_enabled: u8::from(args.payload_padding),
-        padding_max_len: args.payload_padding_max_len.clamp(1, 5),
+        padding_max_len: args.payload_padding_max_len.clamp(2, 254),
         obfuscate_enabled: u8::from(args.obfuscate),
         tcp_extensions: u8::from(args.tcp_extensions),
         obfuscate_prob_bp: ((args.obfuscate_prob.clamp(0.0, 100.0)) * 100.0) as u32,
-        obfuscate_max_len: args.obfuscate_max_len.max(1),
+        obfuscate_max_len: args.obfuscate_max_len.max(4),
         transparent: u8::from(args.transparent),
         internal_udp_port,
         local_mac: net_if.mac,
@@ -163,6 +164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cfg_map: Array<_, RudpConfig> = Array::try_from(ebpf.map_mut("RUDP_CFG").unwrap())?;
         cfg_map.set(0, cfg, 0)?;
     }
+
+    enable_local_routing_sysctls(&net_if.name);
 
     if let Err(e) = tc::qdisc_add_clsact(&net_if.name) {
         warn!("qdisc_add_clsact on {}: {} (continuing)", net_if.name, e);

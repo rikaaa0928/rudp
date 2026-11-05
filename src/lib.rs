@@ -102,6 +102,20 @@ pub fn reset_clsact(if_name: &str, priority: u16) {
         .output();
 }
 
+/// Enables `accept_local` and `route_localnet` sysctls required for local/transparent eBPF packet redirection.
+pub fn enable_local_routing_sysctls(if_name: &str) {
+    let paths = [
+        "/proc/sys/net/ipv4/conf/all/accept_local".to_string(),
+        "/proc/sys/net/ipv4/conf/lo/accept_local".to_string(),
+        format!("/proc/sys/net/ipv4/conf/{if_name}/accept_local"),
+        "/proc/sys/net/ipv4/conf/all/route_localnet".to_string(),
+        format!("/proc/sys/net/ipv4/conf/{if_name}/route_localnet"),
+    ];
+    for p in paths {
+        let _ = fs::write(p, b"1\n");
+    }
+}
+
 /// Monotonic clock in nanoseconds matching `bpf_ktime_get_ns()`.
 pub fn ktime_get_ns() -> u64 {
     let mut ts = libc::timespec {
@@ -301,14 +315,15 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-/// Encodes payload with optional 2-byte sum header + random padding bytes.
+/// Encodes payload with optional 2-byte sum header + random even padding bytes (2..=max_len).
 pub fn encode_payload(payload: &[u8], padding_enabled: bool, max_len: u8) -> Vec<u8> {
     if !padding_enabled {
         return payload.to_vec();
     }
     let mut rng = rand::thread_rng();
-    let max_pad = max_len.clamp(1, 5);
-    let pad_len = rng.gen_range(1..=max_pad);
+    let max_pad = max_len.clamp(2, 254);
+    let num_even = (max_pad / 2).max(1);
+    let pad_len = rng.gen_range(1..=num_even) * 2;
     let b0 = rng.gen_range(1..=127u8);
     let b1 = pad_len.wrapping_sub(b0);
 
