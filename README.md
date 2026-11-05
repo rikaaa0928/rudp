@@ -307,5 +307,5 @@ WantedBy=multi-user.target
 
 ## TODO
 
-- [ ] **大包（>1500B MTU / GRO / GSO）L4 校验和支持**：当前 `ebpf/rudp_ebpf.c` 中的 `compute_l4_csum` 循环上限为 `750` 次（对应 L4 最大长度 `1500` 字节）。在开启 Jumbo Frame 或 GRO/GSO 聚合大包场景下，超过 1500B 的 L4 载荷校验和会被截断，后续可改为基于 `bpf_csum_diff` / `bpf_l4_csum_replace` 的增量校验和更新以彻底解除帧长限制。
+- [x] **大包（>1500B MTU / Jumbo Frame）$O(1)$ 增量 L4 校验和支持**：通过强制偶数长度 Padding 保持 UDP 载荷 16-bit 对齐不变，利用 RFC 1624 增量反码算术直接从原 UDP/TCP 校验和在 $O(1)$ 时间内推导新 L4 校验和（配合 `CHECKSUM_PARTIAL` 前缀抵消），彻底消除载荷遍历循环并支持最高 65535B 大包。
 - [ ] **IPv6 支持**：扩展 `ETH_P_IPV6` 与 IPv6 头部原地改写支持。

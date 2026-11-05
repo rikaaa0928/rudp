@@ -308,7 +308,61 @@ static __always_inline __u16 compute_l4_csum(
     __be32 daddr,
     __u8 proto
 ) {
-    return compute_l4_csum_bounded(skb, l4_len, l4_len, saddr, daddr, proto, 750);
+    return compute_l4_csum_bounded(skb, l4_len, l4_len, saddr, daddr, proto, 20);
+}
+
+/* Extracts the 1's-complement sum of the UDP payload in O(1) from the original UDP header and checksum */
+static __always_inline __u32 extract_udp_payload_sum(
+    __be32 orig_saddr,
+    __be32 orig_daddr,
+    __be16 orig_sport,
+    __be16 orig_dport,
+    __be16 orig_udp_len,
+    __be16 orig_udp_check
+) {
+    __u64 old_hdr_sum = 0;
+    old_hdr_sum += (__u32)orig_saddr & 0xffff;
+    old_hdr_sum += (__u32)orig_saddr >> 16;
+    old_hdr_sum += (__u32)orig_daddr & 0xffff;
+    old_hdr_sum += (__u32)orig_daddr >> 16;
+    old_hdr_sum += (__u32)bpf_htons(IPPROTO_UDP);
+    old_hdr_sum += (__u32)orig_udp_len;
+    old_hdr_sum += (__u32)orig_sport;
+    old_hdr_sum += (__u32)orig_dport;
+    old_hdr_sum += (__u32)orig_udp_len;
+    old_hdr_sum = (old_hdr_sum & 0xffff) + (old_hdr_sum >> 16);
+    old_hdr_sum = (old_hdr_sum & 0xffff) + (old_hdr_sum >> 16);
+
+    __u32 payload_sum = ((__u32)(~orig_udp_check) & 0xffff) + ((__u32)(~old_hdr_sum) & 0xffff);
+    payload_sum = (payload_sum & 0xffff) + (payload_sum >> 16);
+    payload_sum = (payload_sum & 0xffff) + (payload_sum >> 16);
+    return payload_sum;
+}
+
+/* Computes the new UDP checksum in O(1) from the UDP header and pre-extracted payload_sum */
+static __always_inline __u16 compute_udp_csum_from_payload(
+    __be32 saddr,
+    __be32 daddr,
+    __be16 sport,
+    __be16 dport,
+    __be16 udp_len,
+    __u32 payload_sum
+) {
+    __u64 sum = payload_sum;
+    sum += (__u32)saddr & 0xffff;
+    sum += (__u32)saddr >> 16;
+    sum += (__u32)daddr & 0xffff;
+    sum += (__u32)daddr >> 16;
+    sum += (__u32)bpf_htons(IPPROTO_UDP);
+    sum += (__u32)udp_len;
+    sum += (__u32)sport;
+    sum += (__u32)dport;
+    sum += (__u32)udp_len;
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    __u16 csum = ~(__u16)sum;
+    return csum == 0 ? 0xffff : csum;
 }
 
 static __always_inline void finalize_tcp_csum(
@@ -317,7 +371,7 @@ static __always_inline void finalize_tcp_csum(
     __be32 saddr,
     __be32 daddr,
     __u32 pad_total,
-    __u32 max_words
+    __u32 payload_sum
 ) {
     __u16 zero = 0;
     bpf_skb_store_bytes(skb, 50, &zero, 2, 0);
@@ -347,7 +401,50 @@ static __always_inline void finalize_tcp_csum(
         bpf_skb_store_bytes(skb, 50, &zero, 2, 0);
     }
 
-    __u16 csum = compute_l4_csum_bounded(skb, tcp_total_len, tcp_total_len, saddr, daddr, IPPROTO_TCP, max_words);
+    /* Incremental O(1) TCP checksum: sum only 20B TCP header + pad_total (<= 19 words) + payload_sum */
+    __u16 prefix_csum = compute_l4_csum_bounded(
+        skb, 20 + pad_total, tcp_total_len, saddr, daddr, IPPROTO_TCP, 19
+    );
+    __u32 total_sum = ((__u32)(~prefix_csum) & 0xffff) + payload_sum;
+    total_sum = (total_sum & 0xffff) + (total_sum >> 16);
+    total_sum = (total_sum & 0xffff) + (total_sum >> 16);
+    __u16 csum = ~(__u16)total_sum;
+    bpf_skb_store_bytes(skb, 50, &csum, 2, 0);
+}
+
+static __always_inline void finalize_obfuscate_tcp_csum(
+    struct __sk_buff *skb,
+    __u32 dummy_tcp_len,
+    __be32 saddr,
+    __be32 daddr,
+    __u32 pad_total
+) {
+    __u16 zero = 0;
+    bpf_skb_store_bytes(skb, 50, &zero, 2, 0);
+
+    if (pad_total >= 4 && (pad_total & 1) == 0) {
+        bpf_l4_csum_replace(skb, 50, 0, 0x1234, 2);
+        __u16 probe = 0;
+        bpf_skb_load_bytes(skb, 50, &probe, 2);
+
+        if (probe == 0) {
+            if (pad_total == 4) {
+                __u16 csum = compute_l4_csum_bounded(skb, 16, dummy_tcp_len, saddr, daddr, IPPROTO_TCP, 8);
+                __u16 s1 = ~csum;
+                bpf_skb_store_bytes(skb, 50, &csum, 2, 0);
+                bpf_skb_store_bytes(skb, 56, &s1, 2, 0);
+                return;
+            } else {
+                bpf_skb_store_bytes(skb, 52 + pad_total, &zero, 2, 0);
+                __u16 csum = compute_l4_csum_bounded(skb, 12 + pad_total, dummy_tcp_len, saddr, daddr, IPPROTO_TCP, 16);
+                bpf_skb_store_bytes(skb, 50, &csum, 2, 0);
+                return;
+            }
+        }
+        bpf_skb_store_bytes(skb, 50, &zero, 2, 0);
+    }
+
+    __u16 csum = compute_l4_csum_bounded(skb, dummy_tcp_len, dummy_tcp_len, saddr, daddr, IPPROTO_TCP, 140);
     bpf_skb_store_bytes(skb, 50, &csum, 2, 0);
 }
 
@@ -431,6 +528,7 @@ static __always_inline int client_encap_udp_to_faketcp(
     struct conn_state *conn,
     struct ethhdr *out_eth,
     __u32 udp_payload_len,
+    __u32 payload_sum,
     __u64 now,
     int is_ingress
 ) {
@@ -495,7 +593,7 @@ static __always_inline int client_encap_udp_to_faketcp(
         store_padding_hdr(skb, pad_len, rand_val);
     }
 
-    finalize_tcp_csum(skb, tcp_total_len, new_ip.saddr, new_ip.daddr, pad_total, 750);
+    finalize_tcp_csum(skb, tcp_total_len, new_ip.saddr, new_ip.daddr, pad_total, payload_sum);
 
     __sync_fetch_and_add(&stats->tx_pkts, 1);
     __sync_fetch_and_add(&stats->tx_bytes, udp_payload_len);
@@ -535,7 +633,7 @@ static __always_inline int client_encap_udp_to_faketcp(
         if (store_obfuscate_padding(skb, dummy_pad_len, obf_rand) < 0)
             return TC_ACT_SHOT;
 
-        finalize_tcp_csum(skb, dummy_tcp_len, new_ip.saddr, new_ip.daddr, pad_total, 140);
+        finalize_obfuscate_tcp_csum(skb, dummy_tcp_len, new_ip.saddr, new_ip.daddr, pad_total);
 
         __sync_fetch_and_add(&stats->tx_obfuscate_pkts, 1);
     }
@@ -867,6 +965,9 @@ int rudp_server_egress(struct __sk_buff *skb) {
     __be32 saddr = ip->saddr;
     __be32 daddr = ip->daddr;
     __u8 tos = ip->tos;
+    __u32 payload_sum = extract_udp_payload_sum(
+        saddr, daddr, udp->source, udp->dest, udp->len, udp->check
+    );
 
     __u32 rand_val = bpf_get_prandom_u32();
     __u32 pad_len = 0;
@@ -926,7 +1027,7 @@ int rudp_server_egress(struct __sk_buff *skb) {
         store_padding_hdr(skb, pad_len, rand_val);
     }
 
-    finalize_tcp_csum(skb, tcp_total_len, saddr, daddr, pad_total, 750);
+    finalize_tcp_csum(skb, tcp_total_len, saddr, daddr, pad_total, payload_sum);
 
     __sync_fetch_and_add(&stats->tx_pkts, 1);
     __sync_fetch_and_add(&stats->tx_bytes, udp_payload_len);
@@ -963,7 +1064,7 @@ int rudp_server_egress(struct __sk_buff *skb) {
         if (store_obfuscate_padding(skb, dummy_pad_len, obf_rand) < 0)
             return TC_ACT_SHOT;
 
-        finalize_tcp_csum(skb, dummy_tcp_len, saddr, daddr, pad_total, 140);
+        finalize_obfuscate_tcp_csum(skb, dummy_tcp_len, saddr, daddr, pad_total);
 
         __sync_fetch_and_add(&stats->tx_obfuscate_pkts, 1);
     }
@@ -1063,6 +1164,9 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         if (ip_tot_len <= 28)
             return TC_ACT_SHOT;
         __u32 udp_payload_len = ip_tot_len - 28;
+        __u32 payload_sum = extract_udp_payload_sum(
+            ip->saddr, ip->daddr, udp->source, udp->dest, udp->len, udp->check
+        );
 
         /* Record upstream client's real L2 MAC for return traffic */
         copy_mac(conn->peer_mac, eth->h_source);
@@ -1075,7 +1179,7 @@ int rudp_client_ingress(struct __sk_buff *skb) {
             copy_mac(new_eth.h_dest, eth->h_source);
         }
 
-        return client_encap_udp_to_faketcp(skb, cfg, stats, conn, &new_eth, udp_payload_len, now, 1);
+        return client_encap_udp_to_faketcp(skb, cfg, stats, conn, &new_eth, udp_payload_len, payload_sum, now, 1);
     }
 
     /* ------------------------------------------------------------------------
@@ -1216,11 +1320,33 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         }
 
         struct ethhdr orig_eth = *eth;
+        __be32 orig_saddr = ip->saddr;
+        __be32 orig_daddr = ip->daddr;
+        __be16 orig_tcp_check = tcp->check;
         __be32 client_ip = conn->client_ip;
         __be16 client_port = conn->client_port;
         __be32 src_ip = conn->orig_dst_ip
             ? conn->orig_dst_ip
             : (cfg->transparent ? cfg->remote_ip : cfg->local_ip);
+
+        int is_local_client = (client_ip == cfg->local_ip || client_ip == bpf_htonl(IPV4_LOOPBACK));
+        __u32 payload_sum = 0;
+        if (!is_local_client) {
+            __u16 zero16 = 0;
+            bpf_skb_store_bytes(skb, 50, &zero16, 2, 0);
+            __u16 old_prefix_csum = compute_l4_csum_bounded(
+                skb,
+                tcp_hdr_len + pad_total,
+                tcp_hdr_len + tcp_payload_len,
+                orig_saddr,
+                orig_daddr,
+                IPPROTO_TCP,
+                40
+            );
+            payload_sum = ((__u32)(~orig_tcp_check) & 0xffff) + (__u32)old_prefix_csum;
+            payload_sum = (payload_sum & 0xffff) + (payload_sum >> 16);
+            payload_sum = (payload_sum & 0xffff) + (payload_sum >> 16);
+        }
 
         __s32 shrink_len = (__s32)(ip_hdr_len + tcp_hdr_len + pad_total) - 28;
         if (bpf_skb_adjust_room(skb, -shrink_len, BPF_ADJ_ROOM_NET, 0) < 0) {
@@ -1251,7 +1377,7 @@ int rudp_client_ingress(struct __sk_buff *skb) {
         __sync_fetch_and_add(&stats->rx_bytes, udp_payload_len);
 
         /* Local client (transparent mode or local proxy mode on local_ip / 127.0.0.1) */
-        if (client_ip == cfg->local_ip || client_ip == bpf_htonl(IPV4_LOOPBACK)) {
+        if (is_local_client) {
             bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
             bpf_skb_store_bytes(skb, 34, &new_udp, sizeof(new_udp), 0);
             return TC_ACT_OK;
@@ -1266,14 +1392,13 @@ int rudp_client_ingress(struct __sk_buff *skb) {
             copy_mac(out_eth.h_dest, orig_eth.h_source);
         }
 
+        new_udp.check = compute_udp_csum_from_payload(
+            new_ip.saddr, new_ip.daddr, new_udp.source, new_udp.dest, new_udp.len, payload_sum
+        );
+
         bpf_skb_store_bytes(skb, 0, &out_eth, sizeof(out_eth), 0);
         bpf_skb_store_bytes(skb, 14, &new_ip, sizeof(new_ip), 0);
         bpf_skb_store_bytes(skb, 34, &new_udp, sizeof(new_udp), 0);
-
-        __u16 udp_csum = compute_l4_csum(skb, 8 + udp_payload_len, new_ip.saddr, new_ip.daddr, IPPROTO_UDP);
-        if (udp_csum == 0)
-            udp_csum = 0xffff;
-        bpf_skb_store_bytes(skb, 34 + 6, &udp_csum, sizeof(udp_csum), 0);
 
         return bpf_redirect(skb->ifindex, 0);
     }
@@ -1363,8 +1488,11 @@ int rudp_client_egress(struct __sk_buff *skb) {
     if (ip_tot_len <= 28)
         return TC_ACT_SHOT;
     __u32 udp_payload_len = ip_tot_len - 28;
+    __u32 payload_sum = extract_udp_payload_sum(
+        ip->saddr, ip->daddr, udp->source, udp->dest, udp->len, udp->check
+    );
 
-    return client_encap_udp_to_faketcp(skb, cfg, stats, conn, 0, udp_payload_len, now, 0);
+    return client_encap_udp_to_faketcp(skb, cfg, stats, conn, 0, udp_payload_len, payload_sum, now, 0);
 }
 
 char _license[] SEC("license") = "Dual MIT/GPL";

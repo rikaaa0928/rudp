@@ -241,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut buf = [0u8; 2048];
+    let mut buf = vec![0u8; 65536];
     let mut pending_handshakes: HashMap<PeerKey, PendingHandshake> = HashMap::new();
     let mut last_stats = RudpStats::default();
     let mut handshake_ticker = tokio::time::interval(Duration::from_millis(15));
