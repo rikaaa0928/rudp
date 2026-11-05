@@ -172,7 +172,7 @@ Options:
       --payload-padding
           开启随机长度载荷填充头
       --payload-padding-max-len <PAYLOAD_PADDING_MAX_LEN>
-          数据包最大随机偶数填充长度（2..=254）[默认: 4]
+          数据包最大随机偶数填充长度（2..=16）[默认: 4]
       --obfuscate
           开启内核态随机混淆包注入 [环境变量: RUDP_OBFUSCATE]
       --obfuscate-prob <OBFUSCATE_PROB>
@@ -208,7 +208,7 @@ Options:
       --payload-padding
           开启随机长度载荷填充头
       --payload-padding-max-len <PAYLOAD_PADDING_MAX_LEN>
-          数据包最大随机偶数填充长度（2..=254）[默认: 4]
+          数据包最大随机偶数填充长度（2..=16）[默认: 4]
       --obfuscate
           开启内核态随机混淆包注入 [环境变量: RUDP_OBFUSCATE]
       --obfuscate-prob <OBFUSCATE_PROB>

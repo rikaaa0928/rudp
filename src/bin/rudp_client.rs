@@ -52,7 +52,7 @@ struct Args {
     #[arg(long = "payload-padding", default_value_t = false)]
     payload_padding: bool,
 
-    /// Maximum random even padding length (2..=254, rounded down to even)
+    /// Maximum random even padding length (2..=16, rounded down to even)
     #[arg(long = "payload-padding-max-len", default_value_t = 4)]
     payload_padding_max_len: u8,
 
@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_port,
         remote_port,
         padding_enabled: u8::from(args.payload_padding),
-        padding_max_len: args.payload_padding_max_len.clamp(2, 254),
+        padding_max_len: args.payload_padding_max_len.clamp(2, 16),
         obfuscate_enabled: u8::from(args.obfuscate),
         tcp_extensions: u8::from(args.tcp_extensions),
         obfuscate_prob_bp: ((args.obfuscate_prob.clamp(0.0, 100.0)) * 100.0) as u32,
