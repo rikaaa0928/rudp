@@ -181,10 +181,12 @@ Options:
           混淆包最大随机填充长度（4..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
       --tcp-extensions
           开启真实 TCP Options 与 PSH|ACK 标志位伪装
-      --disable-tx-offload [<DISABLE_TX_OFFLOAD>]
-          启动时自动执行 `ethtool -K <iface> tx off`，退出时自动还原 `tx on tso on` [环境变量: RUDP_DISABLE_TX_OFFLOAD] [默认: true]
-      --keep-tx-offload
-          保持网卡 TX 校验和卸载与 TSO 开启（等价于 `--disable-tx-offload=false`）
+      --tx-offload <TX_OFFLOAD>
+          网卡 TX 校验和卸载模式：
+          - auto（默认）：默认保持开启，自动嗅探网卡特性与流量并在需要时才关闭（退出时自动恢复）
+          - on：始终保持开启
+          - off：启动时关闭（`ethtool -K <iface> tx off`），退出时自动恢复 `tx on tso on`
+          [环境变量: RUDP_TX_OFFLOAD] [默认: auto] [可选值: auto, on, off]
   -h, --help
           打印帮助信息
   -V, --version
@@ -217,10 +219,8 @@ Options:
           混淆包最大随机填充长度（4..=255）[环境变量: RUDP_OBFUSCATE_MAX_LEN] [默认: 255]
       --tcp-extensions
           开启真实 TCP Options 与 PSH|ACK 标志位伪装
-      --disable-tx-offload [<DISABLE_TX_OFFLOAD>]
-          透明模式下启动时自动执行 `ethtool -K <iface> tx off`，退出时自动还原 `tx on tso on` [环境变量: RUDP_DISABLE_TX_OFFLOAD] [默认: true]
-      --keep-tx-offload
-          保持网卡 TX 校验和卸载与 TSO 开启（等价于 `--disable-tx-offload=false`）
+      --tx-offload <TX_OFFLOAD>
+          透明模式下网卡 TX 校验和卸载模式（auto / on / off）[环境变量: RUDP_TX_OFFLOAD] [默认: auto]
   -h, --help
           打印帮助信息
   -V, --version

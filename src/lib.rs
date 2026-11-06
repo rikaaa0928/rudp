@@ -526,3 +526,210 @@ impl Drop for RawTcpSocket {
         }
     }
 }
+
+/// NIC TX checksum offload control mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum TxOffloadMode {
+    /// Keep TX offload ON by default; auto-sniff NIC capabilities and traffic to disable only when needed
+    Auto,
+    /// Always keep NIC TX checksum offload ON
+    On,
+    /// Always disable NIC TX checksum offload (`ethtool -K <iface> tx off`) on startup and restore on exit
+    Off,
+}
+
+impl std::fmt::Display for TxOffloadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxOffloadMode::Auto => write!(f, "auto"),
+            TxOffloadMode::On => write!(f, "on"),
+            TxOffloadMode::Off => write!(f, "off"),
+        }
+    }
+}
+
+/// Manages NIC TX checksum offload state with startup capability sniffing, runtime fallback sniffing, and exit restoration.
+pub struct TxOffloadManager {
+    iface: String,
+    mode: TxOffloadMode,
+    uses_tc_egress: bool,
+    disabled_by_us: bool,
+}
+
+impl TxOffloadManager {
+    pub fn new(iface: &str, mode: TxOffloadMode, uses_tc_egress: bool) -> Self {
+        let mut mgr = Self {
+            iface: iface.to_string(),
+            mode,
+            uses_tc_egress,
+            disabled_by_us: false,
+        };
+
+        if !uses_tc_egress {
+            return mgr;
+        }
+
+        match mode {
+            TxOffloadMode::On => {
+                log::info!("TX checksum offload on {}: kept ON (--tx-offload=on)", iface);
+            }
+            TxOffloadMode::Off => {
+                mgr.disable_offload("forced by --tx-offload=off");
+            }
+            TxOffloadMode::Auto => {
+                if let Some(reason) = Self::sniff_nic_requires_tx_off(iface) {
+                    mgr.disable_offload(reason);
+                } else {
+                    log::info!(
+                        "TX checksum offload on {}: kept ON (auto-sniffed generic csum support; runtime fallback active)",
+                        iface
+                    );
+                }
+            }
+        }
+
+        mgr
+    }
+
+    pub fn status_str(&self) -> &'static str {
+        if self.disabled_by_us {
+            "off (managed)"
+        } else {
+            "on"
+        }
+    }
+
+    /// Static startup probe: returns `Some(reason)` only if the NIC or hypervisor cannot handle
+    /// `CHECKSUM_PARTIAL` with a shifted `csum_start`.
+    fn sniff_nic_requires_tx_off(iface: &str) -> Option<&'static str> {
+        // 1. Check DMI for Google Compute Engine (Andromeda vSwitch drops VIRTIO_NET_HDR_F_NEEDS_CSUM
+        //    packets when csum_start != 34 even though guest virtio_net reports tx-checksum-ip-generic).
+        for path in [
+            "/sys/class/dmi/id/sys_vendor",
+            "/sys/class/dmi/id/product_name",
+            "/sys/class/dmi/id/board_vendor",
+        ] {
+            if let Ok(content) = fs::read_to_string(path) {
+                if content.contains("Google") {
+                    return Some("auto-sniffed Google Compute Engine vSwitch");
+                }
+            }
+        }
+
+        // 2. Check ethtool -k <iface> feature flags:
+        //    NICs like AWS ENA or Intel ixgbe/i40e have `tx-checksum-ip-generic: off [fixed]` and only
+        //    support protocol-specific `tx-checksum-ipv4` (which hardcodes L4 TCP checksum at offset 50).
+        if let Ok(out) = std::process::Command::new("ethtool")
+            .args(["-k", iface])
+            .output()
+        {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let mut generic_fixed_off = false;
+                let mut generic_on = false;
+                let mut ipv4_on = false;
+
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("tx-checksum-ip-generic:") {
+                        let val = rest.trim();
+                        if val.starts_with("on") {
+                            generic_on = true;
+                        } else if val.contains("[fixed]") {
+                            generic_fixed_off = true;
+                        }
+                    } else if let Some(rest) = trimmed.strip_prefix("tx-checksum-ipv4:") {
+                        let val = rest.trim();
+                        if val.starts_with("on") {
+                            ipv4_on = true;
+                        }
+                    }
+                }
+
+                if generic_fixed_off || (ipv4_on && !generic_on) {
+                    return Some("auto-sniffed protocol-specific NIC without tx-checksum-ip-generic");
+                }
+            }
+        }
+
+        None
+    }
+
+    fn disable_offload(&mut self, reason: &str) {
+        if self.disabled_by_us {
+            return;
+        }
+        match std::process::Command::new("ethtool")
+            .args(["-K", &self.iface, "tx", "off"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                self.disabled_by_us = true;
+                log::info!(
+                    "Disabled TX checksum offload on {} ({}; will restore on exit)",
+                    self.iface,
+                    reason
+                );
+            }
+            Ok(out) => {
+                log::warn!(
+                    "ethtool -K {} tx off exited with {}: {}",
+                    self.iface,
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => {
+                log::warn!("Failed to run ethtool -K {} tx off: {}", self.iface, e);
+            }
+        }
+    }
+
+    /// Runtime traffic anomaly sniffer: if `Auto` kept TX offload ON at startup, monitors eBPF
+    /// counters and automatically disables TX offload if egress packets are being dropped by the
+    /// underlying hypervisor/NIC.
+    pub fn observe_stats(&mut self, prev: &RudpStats, curr: &RudpStats, is_server: bool) {
+        if !self.uses_tc_egress || self.mode != TxOffloadMode::Auto || self.disabled_by_us {
+            return;
+        }
+
+        if is_server {
+            // On server: if TC Egress has transmitted >= 3 replies, but the peer only keeps
+            // retransmitting 148-byte handshake initiations without advancing to data packets,
+            // our TC Egress replies are being dropped by the NIC/hypervisor.
+            let delta_tx = curr.tx_pkts.saturating_sub(prev.tx_pkts);
+            let delta_rx = curr.rx_pkts.saturating_sub(prev.rx_pkts);
+            if curr.tx_pkts >= 3
+                && delta_tx >= 1
+                && delta_rx >= 1
+                && curr.rx_pkts > 0
+                && (curr.rx_bytes / curr.rx_pkts) == 148
+                && (curr.tx_bytes / curr.tx_pkts) == 92
+            {
+                self.disable_offload("runtime auto-sniffed TC Egress response drop");
+            }
+        } else {
+            // On transparent client: if TC Egress has encapsulated and sent >= 3 packets after
+            // handshake completion, but 0 data packets have been received back from the server.
+            if curr.tx_pkts >= 3 && curr.rx_pkts == 0 {
+                self.disable_offload("runtime auto-sniffed TC Egress blackhole (tx_pkts>=3, rx_pkts=0)");
+            }
+        }
+    }
+
+    pub fn restore(&mut self) {
+        if self.disabled_by_us {
+            let _ = std::process::Command::new("ethtool")
+                .args(["-K", &self.iface, "tx", "on", "tso", "on"])
+                .output();
+            log::info!("Restored TX checksum offload and TSO on {}", self.iface);
+            self.disabled_by_us = false;
+        }
+    }
+}
+
+impl Drop for TxOffloadManager {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}

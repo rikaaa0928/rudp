@@ -6,8 +6,8 @@ use rand::Rng;
 use rudp::{
     build_ipv4_tcp_packet, detect_interface, enable_local_routing_sysctls, encode_payload,
     ktime_get_ns, load_ebpf, reset_clsact, ConnState, PeerKey, RawTcpSocket, RudpConfig,
-    RudpStats, STATE_ESTABLISHED, STATE_SYN_RECEIVED, STATE_SYN_SENT, TCP_FLAG_ACK, TCP_FLAG_RST,
-    TCP_FLAG_SYN,
+    RudpStats, TxOffloadManager, TxOffloadMode, STATE_ESTABLISHED, STATE_SYN_RECEIVED,
+    STATE_SYN_SENT, TCP_FLAG_ACK, TCP_FLAG_RST, TCP_FLAG_SYN,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -72,20 +72,14 @@ struct Args {
     #[arg(long = "tcp-extensions", default_value_t = false)]
     tcp_extensions: bool,
 
-    /// Optionally disable NIC TX checksum offload (`ethtool -K <iface> tx off`) in transparent mode and restore on exit
+    /// NIC TX checksum offload mode in transparent mode: `auto` (keep ON by default, auto-sniff and disable only if required), `on` (always keep ON), or `off` (always disable on startup and restore on exit)
     #[arg(
-        long = "disable-tx-offload",
-        env = "RUDP_DISABLE_TX_OFFLOAD",
-        default_value_t = true,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        action = clap::ArgAction::Set
+        long = "tx-offload",
+        env = "RUDP_TX_OFFLOAD",
+        value_enum,
+        default_value_t = TxOffloadMode::Auto
     )]
-    disable_tx_offload: bool,
-
-    /// Shorthand to keep NIC TX checksum offload and TSO enabled (equivalent to --disable-tx-offload=false)
-    #[arg(long = "keep-tx-offload", default_value_t = false)]
-    keep_tx_offload: bool,
+    tx_offload: TxOffloadMode,
 }
 
 fn parse_local_addr(s: &str) -> Result<SocketAddr, String> {
@@ -172,16 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     reset_clsact(&net_if.name, local_port);
 
-    let manage_tx_offload = args.transparent && args.disable_tx_offload && !args.keep_tx_offload;
-    if manage_tx_offload {
-        match std::process::Command::new("ethtool")
-            .args(["-K", &net_if.name, "tx", "off"])
-            .output()
-        {
-            Ok(_) => info!("Disabled TX checksum offload on {} (will restore on exit)", net_if.name),
-            Err(e) => warn!("Failed to run ethtool -K {} tx off: {}", net_if.name, e),
-        }
-    }
+    let mut tx_offload_mgr = TxOffloadManager::new(&net_if.name, args.tx_offload, args.transparent);
 
     let ingress_prog: &mut SchedClassifier = ebpf
         .program_mut("rudp_client_ingress")
@@ -217,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.transparent {
         info!(
-            "rudp_client eBPF attached to {} [TRANSPARENT MODE] (hijacking UDP {} -> FakeTCP {}:{}, internal_udp_port={}, padding={}, tcp_ext={}, obfuscate={}, disable_tx_offload={})",
+            "rudp_client eBPF attached to {} [TRANSPARENT MODE] (hijacking UDP {} -> FakeTCP {}:{}, internal_udp_port={}, padding={}, tcp_ext={}, obfuscate={}, tx_offload={} [{}])",
             net_if.name,
             SocketAddrV4::new(remote_ipv4, local_port),
             remote_ipv4,
@@ -226,7 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.payload_padding,
             args.tcp_extensions,
             args.obfuscate,
-            manage_tx_offload
+            args.tx_offload,
+            tx_offload_mgr.status_str()
         );
     } else {
         info!(
@@ -494,6 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let stats_map: Array<_, RudpStats> = Array::try_from(ebpf.map("RUDP_STATS").unwrap())?;
                     if let Ok(s) = stats_map.get(&0, 0) {
+                        tx_offload_mgr.observe_stats(&last_stats, &s, false);
                         if s.rx_pkts != last_stats.rx_pkts || s.tx_pkts != last_stats.tx_pkts || s.handshakes != last_stats.handshakes {
                             info!(
                                 "eBPF stats: handshakes={} tx_pkts={} ({} B) rx_pkts={} ({} B) obf_tx={} obf_rx={} drops={}",
@@ -589,12 +576,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if manage_tx_offload {
-        let _ = std::process::Command::new("ethtool")
-            .args(["-K", &net_if.name, "tx", "on", "tso", "on"])
-            .output();
-        info!("Restored TX checksum offload and TSO on {}", net_if.name);
-    }
+    tx_offload_mgr.restore();
 
     Ok(())
 }
